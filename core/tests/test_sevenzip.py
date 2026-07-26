@@ -18,11 +18,15 @@ from ratarmountcore.mountsource.factory import open_mount_source
 from ratarmountcore.mountsource.formats.sevenzip import SevenZipMountSource
 from ratarmountcore.sevenzip import (
     METHOD_AES,
+    METHOD_BCJ,
     METHOD_COPY,
     METHOD_LZMA2,
+    Coder,
     SevenZipError,
     StreamingFolderDecoder,
+    build_native_filter_chain,
     decompress_folder,
+    lzma2_filter_from_folder_properties,
     parse_7z_archive,
 )
 
@@ -71,6 +75,7 @@ class TestSevenZipParser:
             "nested-encrypted-inner.7z",
             "double-compressed-nested-tar.tar.7z.7z",
             "encrypted-nested-tar.7z",
+            "bcj-lzma2-x86.7z",
         ],
     )
     def test_parse_fixture(self, name):
@@ -131,6 +136,60 @@ class TestSevenZipParser:
         with open(path, "rb") as file:
             info = parse_7z_archive(file)
         assert len([e for e in info.files if e.size > 0]) == 2
+
+    def test_parse_bcj_lzma2_chain(self):
+        with open(_require_fixture("bcj-lzma2-x86.7z"), "rb") as file:
+            info = parse_7z_archive(file)
+        folder = info.folders[0]
+        assert folder.is_supported_for_open()
+        methods = [c.method for c in folder.coders]
+        assert METHOD_LZMA2 in methods
+        assert METHOD_BCJ in methods or any(m.endswith(b"\x03") for m in methods)
+
+
+class TestLzma2FolderFilter:
+    """LZMA2 must always use folder-level props; stream handles per-chunk changes."""
+
+    def test_lzma2_dict_size_from_folder_property_byte(self):
+        assert lzma2_filter_from_folder_properties(b"\x00")["dict_size"] == 4096
+        assert lzma2_filter_from_folder_properties(b"\x14")["dict_size"] == 4 * 1024 * 1024
+        assert lzma2_filter_from_folder_properties(b"\x18")["dict_size"] == 16 * 1024 * 1024
+        assert lzma2_filter_from_folder_properties(None) == {"id": __import__("lzma").FILTER_LZMA2}
+
+    def test_native_chain_prepends_filters_lzma2_last(self):
+        import lzma
+
+        coders = [
+            Coder(method=METHOD_LZMA2, properties=b"\x14"),
+            Coder(method=METHOD_BCJ, properties=None),
+        ]
+        chain = build_native_filter_chain(coders)
+        assert chain[0]["id"] == lzma.FILTER_X86
+        assert chain[-1]["id"] == lzma.FILTER_LZMA2
+        assert chain[-1]["dict_size"] == 4 * 1024 * 1024
+
+    def test_bcj_lzma2_roundtrip(self):
+        path = _require_fixture("bcj-lzma2-x86.7z")
+        with open(path, "rb") as archive:
+            info = parse_7z_archive(archive)
+            entry = next(e for e in info.files if e.size > 0)
+            archive.seek(entry.pack_offset)
+            packed = archive.read(entry.pack_size)
+            full = decompress_folder(info.folders[0], packed)
+        assert full.endswith(b"payload-end\n")
+        assert len(full) == entry.size
+
+        # Streaming must match full decode and keep the same folder-level filter.
+        dec = StreamingFolderDecoder(info.folders[0], packed, chunk_size=4096, max_cached_chunks=4)
+        assert dec._native_filters is not None  # pylint: disable=protected-access
+        assert dec._native_filters[-1]["id"] == __import__("lzma").FILTER_LZMA2  # pylint: disable=protected-access
+        assert dec.read_range(0, 50) == full[:50]
+        mid = len(full) // 2
+        assert dec.read_range(mid, 50) == full[mid : mid + 50]
+
+        with SevenZipMountSource(path, indexFilePath=":memory:") as mount_source:
+            with mount_source.open(mount_source.lookup("/x.bin")) as file:
+                assert file.read() == full
 
 
 # ---------------------------------------------------------------------------

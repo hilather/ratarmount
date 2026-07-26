@@ -68,6 +68,28 @@ METHOD_AES = b"\x06\xf1\x07\x01"
 METHOD_BZIP2 = b"\x04\x02\x02"
 METHOD_DEFLATE = b"\x04\x01\x08"
 METHOD_PPMD = b"\x03\x04\x01"
+METHOD_BCJ_X86 = b"\x04"
+METHOD_BCJ_PPC = b"\x03\x03\x02\x05"
+METHOD_BCJ_IA64 = b"\x03\x03\x04\x01"
+METHOD_BCJ_ARM = b"\x03\x03\x05\x01"
+METHOD_BCJ_ARMT = b"\x03\x03\x07\x01"
+METHOD_BCJ_SPARC = b"\x03\x03\x08\x05"
+
+# 7z method id -> liblzma filter id for native filter chains.
+# LZMA2 is special: only folder-level dict_size is set here; the LZMA2 bitstream
+# carries per-chunk property resets (lc/lp/pb etc.) handled by liblzma itself.
+_METHOD_TO_LZMA_FILTER_ID = {
+    METHOD_LZMA2: lzma.FILTER_LZMA2,
+    METHOD_LZMA: lzma.FILTER_LZMA1,
+    METHOD_DELTA: lzma.FILTER_DELTA,
+    METHOD_BCJ: lzma.FILTER_X86,
+    METHOD_BCJ_X86: lzma.FILTER_X86,
+    METHOD_BCJ_PPC: lzma.FILTER_POWERPC,
+    METHOD_BCJ_IA64: lzma.FILTER_IA64,
+    METHOD_BCJ_ARM: lzma.FILTER_ARM,
+    METHOD_BCJ_ARMT: lzma.FILTER_ARMTHUMB,
+    METHOD_BCJ_SPARC: lzma.FILTER_SPARC,
+}
 
 # Windows FILETIME epoch (1601-01-01) vs Unix epoch (1970-01-01).
 _FILETIME_UNIX_DELTA = 116444736000000000
@@ -190,18 +212,23 @@ class Folder:
     def is_encrypted(self) -> bool:
         return any(c.method == METHOD_AES for c in self.coders)
 
+    def content_coders(self) -> list[Coder]:
+        """Coders after stripping a leading AES encryption coder, if any."""
+        coders = list(self.coders)
+        if coders and coders[0].method == METHOD_AES:
+            return coders[1:]
+        return coders
+
     def is_supported_for_open(self, *, allow_encrypted: bool = False) -> bool:
         """Return whether this folder can be opened with the current decoder set."""
         if not self.coders:
             return False
-        coders = list(self.coders)
-        if coders and coders[0].method == METHOD_AES:
-            if not allow_encrypted:
-                return False
-            coders = coders[1:]
-            if not coders:
-                # AES-only folder: treat decrypted bytes as Copy.
-                return True
+        if self.is_encrypted() and not allow_encrypted:
+            return False
+        coders = self.content_coders()
+        if not coders:
+            # AES-only folder: treat decrypted bytes as Copy.
+            return self.is_encrypted() and allow_encrypted
         if len(coders) == 1 and coders[0].method in (
             METHOD_COPY,
             METHOD_LZMA,
@@ -210,14 +237,12 @@ class Folder:
             METHOD_DEFLATE,
         ):
             return True
-        # Simple BCJ + LZMA(2) chains are common for executables; not yet supported.
-        return False
+        # Native liblzma filter chains (e.g. BCJ + LZMA2).
+        return _coders_are_native_lzma_chain(coders)
 
     def content_coder(self) -> Optional[Coder]:
-        """Return the non-AES content coder, if this is a supported simple chain."""
-        coders = list(self.coders)
-        if coders and coders[0].method == METHOD_AES:
-            coders = coders[1:]
+        """Return the non-AES content coder, if this is a single-coder chain."""
+        coders = self.content_coders()
         if len(coders) == 1:
             return coders[0]
         return None
@@ -797,9 +822,9 @@ def prepare_folder_packed(
 ) -> tuple[Folder, bytes]:
     """Strip a leading AES coder (if any) and return (content_folder, content_packed).
 
-    For unencrypted folders this is a no-op. For AES+compressor chains the packed
-    bytes are decrypted and a synthetic single-coder folder is returned so the
-    existing streaming decoder can run unchanged.
+    For unencrypted folders this is a no-op. For AES+codec chains the packed bytes
+    are decrypted and a synthetic folder containing only the post-AES coders is
+    returned so the existing streaming decoder can run unchanged.
     """
     if not folder.coders:
         raise SevenZipError("Folder has no coders")
@@ -829,23 +854,30 @@ def prepare_folder_packed(
         )
         return content, decrypted
 
-    if len(rest) != 1:
+    if len(rest) == 1:
+        content_coder = rest[0]
+        if content_coder.method not in (
+            METHOD_COPY,
+            METHOD_LZMA,
+            METHOD_LZMA2,
+            METHOD_BZIP2,
+            METHOD_DEFLATE,
+        ) and content_coder.method not in _METHOD_TO_LZMA_FILTER_ID:
+            raise SevenZipError(f"Unsupported codec after AES: {content_coder.method.hex()}")
+    elif not _coders_are_native_lzma_chain(rest):
         raise SevenZipError(f"Unsupported encrypted coder chain: {[c.method.hex() for c in folder.coders]}")
-
-    content_coder = rest[0]
-    if content_coder.method not in (METHOD_COPY, METHOD_LZMA, METHOD_LZMA2, METHOD_BZIP2, METHOD_DEFLATE):
-        raise SevenZipError(f"Unsupported codec after AES: {content_coder.method.hex()}")
 
     # Remaining unpack sizes belong to the content coder(s).
     content_unpack = folder.unpack_sizes[1:] if len(folder.unpack_sizes) > 1 else [folder.get_unpack_size()]
     content = Folder(
         coders=[
             Coder(
-                method=content_coder.method,
-                num_in_streams=content_coder.num_in_streams,
-                num_out_streams=content_coder.num_out_streams,
-                properties=content_coder.properties,
+                method=c.method,
+                num_in_streams=c.num_in_streams,
+                num_out_streams=c.num_out_streams,
+                properties=c.properties,
             )
+            for c in rest
         ],
         unpack_sizes=content_unpack if content_unpack else [folder.get_unpack_size()],
         has_crc=folder.has_crc,
@@ -854,23 +886,83 @@ def prepare_folder_packed(
     return content, decrypted
 
 
-def _lzma_filter_from_coder(coder: Coder) -> dict:
-    """Build a stdlib lzma filter dict from a 7z coder (uses CPython private helper)."""
-    if coder.method == METHOD_LZMA2:
-        filter_id = lzma.FILTER_LZMA2
-    elif coder.method == METHOD_LZMA:
-        filter_id = lzma.FILTER_LZMA1
+def _coders_are_native_lzma_chain(coders: Sequence[Coder]) -> bool:
+    """True if every coder maps to a liblzma filter (BCJ/Delta/LZMA/LZMA2 chain)."""
+    if not coders:
+        return False
+    # Must include a compressor; pure filter stacks are not useful alone.
+    has_compressor = any(c.method in (METHOD_LZMA, METHOD_LZMA2) for c in coders)
+    if not has_compressor:
+        return False
+    return all(c.method in _METHOD_TO_LZMA_FILTER_ID for c in coders)
+
+
+def lzma2_filter_from_folder_properties(properties: Optional[bytes]) -> dict:
+    """Build the liblzma LZMA2 filter from **folder-level** 7z coder properties only.
+
+    The 7z folder stores a single property byte encoding the dictionary size.
+    Per-chunk LZMA2 property changes (lc/lp/pb, resets, uncompressed chunks) live
+    inside the LZMA2 bitstream and are handled by liblzma — they must not be used
+    to rebuild or replace this filter mid-stream.
+    """
+    filt: dict = {"id": lzma.FILTER_LZMA2}
+    if not properties:
+        return filt
+    prop = properties[0]
+    if prop > 40:
+        raise SevenZipError(f"Invalid LZMA2 folder property byte: {prop}")
+    if prop == 40:
+        # 7z encodes "dict size = 2^32 - 1" as property 40; liblzma max is 1.5 GiB.
+        # Cap to the largest power-of-two dict liblzma accepts in practice.
+        dict_size = 1536 * 1024 * 1024
     else:
-        raise SevenZipError(f"Not an LZMA coder: {coder.method.hex()}")
+        dict_size = (2 | (prop & 1)) << (prop // 2 + 11)
+    filt["dict_size"] = dict_size
+    return filt
+
+
+def _lzma_filter_from_coder(coder: Coder) -> dict:
+    """Build a stdlib lzma filter dict from a 7z folder coder (folder-level props only)."""
+    if coder.method == METHOD_LZMA2:
+        # Always folder-level dict_size only; stream handles per-chunk props.
+        return lzma2_filter_from_folder_properties(coder.properties)
+
+    filter_id = _METHOD_TO_LZMA_FILTER_ID.get(coder.method)
+    if filter_id is None:
+        if coder.method == METHOD_LZMA:
+            filter_id = lzma.FILTER_LZMA1
+        else:
+            raise SevenZipError(f"Not a native lzma-chain coder: {coder.method.hex()}")
 
     properties = coder.properties
     if properties is not None:
-        # CPython exposes this to map 7z/XZ filter property blobs to filter dicts.
         decode = getattr(lzma, "_decode_filter_properties", None)
         if decode is None:
             raise SevenZipError("This Python build lacks lzma._decode_filter_properties")
         return decode(filter_id, properties)
     return {"id": filter_id}
+
+
+def build_native_filter_chain(coders: Sequence[Coder]) -> list[dict]:
+    """Build a liblzma RAW filter chain for 7z content coders.
+
+    Coder order in the 7z folder is pack→unpack processing order. liblzma expects
+    the opposite for decompression (last compression filter applied first), so each
+    coder is prepended — matching py7zr's construction.
+
+    For LZMA2 coders the filter always comes from :func:`lzma2_filter_from_folder_properties`
+    (folder-level dict size only).
+    """
+    filters: list[dict] = []
+    for coder in coders:
+        if coder.method == METHOD_COPY:
+            continue
+        filters.insert(0, _lzma_filter_from_coder(coder))
+    if not filters:
+        raise SevenZipError("Empty native filter chain")
+    # liblzma requires the LZMA/LZMA2 filter last in the list for decompression chains.
+    # After prepending, LZMA2 (usually first in 7z coders) ends last — correct.
+    return filters
 
 
 def _lzma_decompress_raw(packed: bytes, filters: list[dict], unpack_size: int) -> bytes:
@@ -931,7 +1023,15 @@ class StreamingFolderDecoder:
         self._unpacked_pos = 0
         self._pending = bytearray()
         self._finished = False
-        self._method = folder.coders[0].method if folder.coders else METHOD_COPY
+        coders = list(folder.coders)
+        self._method = coders[0].method if coders else METHOD_COPY
+        # Native multi-filter chain (BCJ+LZMA2, …). LZMA2 always uses folder-level props.
+        self._native_filters: Optional[list[dict]] = None
+        if len(coders) == 1 and coders[0].method in (METHOD_LZMA, METHOD_LZMA2):
+            self._native_filters = build_native_filter_chain(coders)
+        elif _coders_are_native_lzma_chain(coders):
+            self._native_filters = build_native_filter_chain(coders)
+            self._method = METHOD_LZMA2  # treat as lzma-family streaming path
         # Bytes decoded so far that have been fully committed to chunks or pending.
         self._pending_base = 0  # unpacked offset of pending[0]
 
@@ -951,9 +1051,13 @@ class StreamingFolderDecoder:
         self._touch_chunk(index)
 
     def _make_decoder(self):
+        if self._native_filters is not None:
+            # Folder-level filter chain (LZMA2 dict_size from folder props only).
+            # LZMA2 per-chunk property changes stay inside the bitstream.
+            return lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=self._native_filters)
         method = self._method
         if method in (METHOD_LZMA, METHOD_LZMA2):
-            filters = [_lzma_filter_from_coder(self.folder.coders[0])]
+            filters = build_native_filter_chain(self.folder.coders)
             return lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters)
         if method == METHOD_DEFLATE:
             return zlib.decompressobj(wbits=-15)
@@ -1013,7 +1117,7 @@ class StreamingFolderDecoder:
         if self._decoder is None and self._method != METHOD_COPY:
             self._reset_decoder()
 
-        if self._method == METHOD_COPY:
+        if self._method == METHOD_COPY and self._native_filters is None:
             target = min(want_unpacked_through, self.unpack_size, len(self.packed))
             if self._unpacked_pos < target:
                 self._emit(self.packed[self._unpacked_pos : target])
@@ -1023,7 +1127,7 @@ class StreamingFolderDecoder:
             remaining_out = want_unpacked_through - self._unpacked_pos
             max_length = max(remaining_out, self.chunk_size)
 
-            if self._method in (METHOD_LZMA, METHOD_LZMA2):
+            if self._native_filters is not None or self._method in (METHOD_LZMA, METHOD_LZMA2):
                 assert self._decoder is not None
                 dec = self._decoder
                 if not getattr(dec, "needs_input", True):
@@ -1062,6 +1166,8 @@ class StreamingFolderDecoder:
                     self._finished = True
                 else:
                     # Input fully consumed whether or not more output is pending.
+                    # Do not rebuild the filter chain here: LZMA2 chunk property
+                    # changes are internal to this decompressor instance.
                     self._packed_pos += len(feed)
                 if out:
                     self._emit(out)
@@ -1128,7 +1234,7 @@ class StreamingFolderDecoder:
         start = max(0, start)
         end = min(self.unpack_size, start + length)
 
-        if self._method == METHOD_COPY:
+        if self._method == METHOD_COPY and self._native_filters is None:
             return self.packed[start:end]
 
         first_chunk = start // self.chunk_size
@@ -1193,21 +1299,29 @@ def decompress_folder(
     content_folder, content_packed = prepare_folder_packed(folder, packed, password=password)
     if not content_folder.coders:
         raise SevenZipError("Folder has no coders")
-    if len(content_folder.coders) != 1:
-        raise SevenZipError(f"Unsupported multi-coder folder: {[c.method.hex() for c in content_folder.coders]}")
 
-    coder = content_folder.coders[0]
-    method = coder.method
     unpack_size = content_folder.get_unpack_size()
+    coders = content_folder.coders
 
-    if method == METHOD_COPY:
+    if len(coders) == 1 and coders[0].method == METHOD_COPY:
         if len(content_packed) < unpack_size:
             raise SevenZipError("Copy-coded data shorter than unpack size")
         return content_packed[:unpack_size]
 
-    if method in (METHOD_LZMA2, METHOD_LZMA):
-        filters = [_lzma_filter_from_coder(coder)]
+    # Single LZMA/LZMA2 or multi-filter native chain (BCJ/Delta + LZMA2, …).
+    # LZMA2 always uses the folder-level filter (dict_size); stream-internal
+    # per-chunk property changes are handled by liblzma.
+    if (len(coders) == 1 and coders[0].method in (METHOD_LZMA, METHOD_LZMA2)) or _coders_are_native_lzma_chain(
+        coders
+    ):
+        filters = build_native_filter_chain(coders)
         return _lzma_decompress_raw(content_packed, filters, unpack_size)
+
+    if len(coders) != 1:
+        raise SevenZipError(f"Unsupported multi-coder folder: {[c.method.hex() for c in coders]}")
+
+    coder = coders[0]
+    method = coder.method
 
     if method == METHOD_DEFLATE:
         # Raw deflate stream.
@@ -1356,6 +1470,12 @@ def method_names(methods: Sequence[bytes]) -> str:
         METHOD_AES: "AES",
         METHOD_PPMD: "PPMd",
         METHOD_BCJ: "BCJ",
+        METHOD_BCJ_X86: "BCJ",
+        METHOD_BCJ_ARM: "BCJ_ARM",
+        METHOD_BCJ_ARMT: "BCJ_ARMT",
+        METHOD_BCJ_PPC: "BCJ_PPC",
+        METHOD_BCJ_SPARC: "BCJ_SPARC",
+        METHOD_BCJ_IA64: "BCJ_IA64",
         METHOD_DELTA: "Delta",
     }
     return "+".join(names.get(m, m.hex()) for m in methods)
