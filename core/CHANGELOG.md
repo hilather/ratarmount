@@ -23,7 +23,9 @@
  - Add `core/tests/test_sevenzip.py` covering parse, store/LZMA2 open, solid streaming seek, AES passwords,
    recursive 7z-in-7z (including AutoMountLayer), and on-disk index reload.
  - Add fixtures: `store-copy-two-files.7z`, `lzma2-two-files-and-medium.7z`, `encrypted-hello.7z`,
-   `nested-inner-hello.7z`, `nested-encrypted-inner.7z`.
+   `nested-inner-hello.7z`, `nested-encrypted-inner.7z`, `bcj-lzma2-x86.7z`,
+   `nested-tar-in-cpio.newc.cpio`, `simple-response.warc`.
+ - Add `core/tests/test_store_archives.py` for CPIO/ISO/WARC/XAR/deb (including tar-in-cpio recursion).
 
 
 # Version 0.11.1 built on 2026-05-19
