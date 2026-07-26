@@ -120,6 +120,7 @@ full = [
     "py7zr ~= 1.0",
     "PySquashfsImage == 0.9.0",
     "lz4 ~= 4.0.0",
+    "unlzw3 ~= 0.2",
     # Should be installed manually because it requires lzo1.h to be installed, which is often missing.
     # python-lzo also has not seen an update in 3 years. If recent wheels existed, the above would not be a problem.
     #"python-lzo ~= 1.0",
@@ -191,6 +192,7 @@ sqlar = [
 squashfs = [
     "PySquashfsImage == 0.9.0",
     "lz4 ~= 4.0.0",
+    "unlzw3 ~= 0.2",
     # Should be installed manually because it requires lzo1.h to be installed, which is often missing.
     # python-lzo also has not seen an update in 3 years. If recent wheels existed, the above would not be a problem.
     #"python-lzo ~= 1.0",

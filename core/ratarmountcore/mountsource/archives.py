@@ -98,7 +98,20 @@ ARCHIVE_BACKENDS: dict[str, ArchiveBackendInfo] = {
         _open_tar_mount_source,
         # Include stream compressions that SQLiteIndexedTar undoes before opening TAR
         # (and for mounting compressed non-TAR payloads as a single file).
-        {FID.TAR, FID.GZIP, FID.ZLIB, FID.DEFLATE, FID.BZIP2, FID.XZ, FID.ZSTANDARD, FID.LZ4},
+        {
+            FID.TAR,
+            FID.GZIP,
+            FID.ZLIB,
+            FID.DEFLATE,
+            FID.BZIP2,
+            FID.XZ,
+            FID.ZSTANDARD,
+            FID.LZ4,
+            FID.LZOP,
+            FID.LZIP,
+            FID.LZMA,
+            FID.Z,
+        },
         [('tarfile', '')],
     ),
     "zipfile": ArchiveBackendInfo(ZipMountSource, {FID.ZIP}, [('zipfile', '')]),

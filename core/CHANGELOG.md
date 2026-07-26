@@ -10,6 +10,11 @@
  - Shared `StenciledArchiveMountSource` base for offset+size archive formats.
  - Add seekable **LZ4** frame backend (`IndexedLZ4File` / `--use-backend lz4`) with block index for
    independent-block random access; preferred over libarchive for `.lz4` and `tar.lz4`.
+ - Add seekable stream backends preferred over libarchive:
+   - **LZOP/LZO** (`IndexedLZOFile`, system `liblzo2`) with per-block index
+   - **compress (.Z)** (`IndexedCompressZFile`, `unlzw3`)
+   - **LZIP** (`IndexedLzipFile`, multimember-aware, stdlib `lzma`)
+   - **LZMA Alone** (`IndexedLZMAFile`, stdlib `lzma`)
  - Add custom `SevenZipMountSource` backend (`--use-backend sevenzip`) that parses 7z headers and stores
    real pack-stream offsets for archive-level random access. Supports Copy, LZMA, LZMA2, Deflate, and BZip2
    (including solid archives). Encrypted archives still fall back to py7zr. Preferred over libarchive for `.7z`.
@@ -30,6 +35,7 @@
    `multiblock-independent.lz4`, `multiblock-dependent.lz4`.
  - Add `core/tests/test_store_archives.py` for CPIO/ISO/WARC/XAR/deb (including tar-in-cpio recursion).
  - Add `core/tests/test_LZ4File.py` for LZ4 seek, skippable frames, and tar.lz4 mounting.
+ - Add `core/tests/test_stream_compressions.py` for LZO, .Z, LZIP, and raw LZMA.
 
 
 # Version 0.11.1 built on 2026-05-19

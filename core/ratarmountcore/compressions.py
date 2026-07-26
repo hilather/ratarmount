@@ -76,6 +76,30 @@ except ImportError:
     def open_lz4_file(fileobj, **kwargs):  # type: ignore
         raise ImportError("Please install lz4 with: pip install lz4")
 
+
+try:
+    from .LZOFile import open_lzo_file
+except Exception:  # liblzo2 may be missing at import of helper
+
+    def open_lzo_file(fileobj, **kwargs):  # type: ignore
+        from .LZOFile import open_lzo_file as _open
+
+        return _open(fileobj, **kwargs)
+
+
+try:
+    import unlzw3  # noqa: F401  # pylint: disable=unused-import
+
+    from .CompressZFile import open_compress_z_file
+except ImportError:
+
+    def open_compress_z_file(fileobj, **kwargs):  # type: ignore
+        raise ImportError("Please install unlzw3 with: pip install unlzw3")
+
+
+from .LzipFile import open_lzip_file  # noqa: E402
+from .LZMAFile import open_lzma_file  # noqa: E402
+
 try:
     from libarchive import file_reader as libarchive_file_reader
 except Exception:
@@ -134,6 +158,30 @@ COMPRESSION_BACKENDS: dict[str, CompressionBackendInfo] = {
         (lambda x, parallelization=1: open_lz4_file(x)),
         {FID.LZ4},
         [('lz4', 'lz4')],
+        'tarfile',
+    ),
+    'lzo': CompressionBackendInfo(
+        (lambda x, parallelization=1: open_lzo_file(x)),
+        {FID.LZOP},
+        [],  # uses system liblzo2 via ctypes
+        'tarfile',
+    ),
+    'compress': CompressionBackendInfo(
+        (lambda x, parallelization=1: open_compress_z_file(x)),
+        {FID.Z},
+        [('unlzw3', 'unlzw3')],
+        'tarfile',
+    ),
+    'lzip': CompressionBackendInfo(
+        (lambda x, parallelization=1: open_lzip_file(x)),
+        {FID.LZIP},
+        [],  # stdlib lzma
+        'tarfile',
+    ),
+    'lzma': CompressionBackendInfo(
+        (lambda x, parallelization=1: open_lzma_file(x)),
+        {FID.LZMA},
+        [],  # stdlib lzma
         'tarfile',
     ),
     'libarchive': CompressionBackendInfo(
