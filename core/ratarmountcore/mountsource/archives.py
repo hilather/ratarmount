@@ -7,6 +7,7 @@ from ratarmountcore.formats import FileFormatID
 from . import MountSource
 from .formats.ar import ARMountSource
 from .formats.asar import ASARMountSource
+from .formats.cab import CABMountSource
 from .formats.cpio import CPIOMountSource
 from .formats.ext4 import EXT4MountSource
 from .formats.fat import FATMountSource
@@ -89,6 +90,7 @@ class ArchiveBackendInfo:
 # The keys are the backend names the user can specify with --backends or via prioritizedBackends arguments.
 ARCHIVE_BACKENDS: dict[str, ArchiveBackendInfo] = {
     "ar": ArchiveBackendInfo(ARMountSource, {FID.AR, FID.AR_THIN}, []),
+    "cab": ArchiveBackendInfo(CABMountSource, {FID.CAB}, []),
     "cpio": ArchiveBackendInfo(CPIOMountSource, {FID.CPIO}, []),
     "iso9660": ArchiveBackendInfo(ISO9660MountSource, {FID.ISO9660}, []),
     "warc": ArchiveBackendInfo(WARCMountSource, {FID.WARC}, []),
@@ -137,8 +139,9 @@ ARCHIVE_BACKENDS: dict[str, ArchiveBackendInfo] = {
     "libarchive": ArchiveBackendInfo(
         _open_libarchive_mount_source,
         {
+            # Custom cab/cpio/iso/warc/xar backends are preferred; libarchive remains a fallback
+            # (e.g. CAB LZX/Quantum folders, or when the custom parser rejects an archive).
             FID.CAB,
-            # Custom cpio/iso/warc/xar backends are preferred; libarchive remains a fallback.
             FID.XAR,
             FID.CPIO,
             FID.ISO9660,
@@ -156,6 +159,8 @@ ARCHIVE_BACKENDS: dict[str, ArchiveBackendInfo] = {
             FID.GZIP,
             FID.XZ,
             FID.ZSTANDARD,
+            # Intentionally no custom random-access backend (Tier D):
+            # grzip/lrzip (exotic), rpm (cpio payload better via nested open), uuencode.
             FID.GRZIP,
             FID.LRZIP,
             FID.LZ4,

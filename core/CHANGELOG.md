@@ -7,6 +7,7 @@
    - **ISO 9660** (`ISO9660MountSource`): extent-based file open
    - **WARC** (`WARCMountSource`): payload offsets from `Content-Length`
    - **XAR** (`XARMountSource`): TOC heap offsets; stored and gzip/bzip2 members
+   - **CAB** (`CABMountSource`): store (none) stencils and MSZIP folders; LZX/Quantum fall back to libarchive
  - Shared `StenciledArchiveMountSource` base for offset+size archive formats.
  - Add seekable **LZ4** frame backend (`IndexedLZ4File` / `--use-backend lz4`) with block index for
    independent-block random access; preferred over libarchive for `.lz4` and `tar.lz4`.
@@ -23,6 +24,8 @@
  - Decrypt AES-256 encrypted 7z content in the custom `sevenzip` backend (SHA-256 key derivation, optional
    `pycryptodomex`), then stream-decompress so large encrypted members are not fully buffered by py7zr.
  - Accept py7zr 1.x (not only 1.0.x) for fallback when the custom backend cannot handle a codec.
+ - Intentionally leave rare/complex formats on **libarchive** (no custom random-access backend):
+   **lrzip**, **grzip**, **rpm** (partial via libarchive), **uuencode**. CAB **LZX/Quantum** folders also fall back.
 
 ## Development
 
@@ -33,7 +36,8 @@
    `nested-inner-hello.7z`, `nested-encrypted-inner.7z`, `bcj-lzma2-x86.7z`,
    `nested-tar-in-cpio.newc.cpio`, `simple-response.warc`,
    `multiblock-independent.lz4`, `multiblock-dependent.lz4`.
- - Add `core/tests/test_store_archives.py` for CPIO/ISO/WARC/XAR/deb (including tar-in-cpio recursion).
+ - Add `core/tests/test_store_archives.py` for CPIO/ISO/WARC/XAR/CAB/deb (including tar-in-cpio recursion).
+
  - Add `core/tests/test_LZ4File.py` for LZ4 seek, skippable frames, and tar.lz4 mounting.
  - Add `core/tests/test_stream_compressions.py` for LZO, .Z, LZIP, and raw LZMA.
 
