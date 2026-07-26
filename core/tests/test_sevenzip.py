@@ -19,9 +19,11 @@ from ratarmountcore.mountsource.formats.sevenzip import SevenZipMountSource
 from ratarmountcore.sevenzip import (
     METHOD_AES,
     METHOD_BCJ,
+    METHOD_BCJ2,
     METHOD_COPY,
     METHOD_LZMA2,
     Coder,
+    FilePackSource,
     SevenZipError,
     StreamingFolderDecoder,
     build_native_filter_chain,
@@ -460,9 +462,16 @@ class TestSevenZipEncryption:
         with copy_test_file("encrypted-hello.7z") as path, pytest.raises(SevenZipError, match="password"):
             SevenZipMountSource(path, indexFilePath=":memory:", passwords=[b"not-the-password"])
 
-    def test_encrypted_missing_password(self):
-        with copy_test_file("encrypted-hello.7z") as path, pytest.raises(SevenZipError, match="encrypted"):
-            SevenZipMountSource(path, indexFilePath=":memory:")
+    def test_encrypted_missing_password_metadata_only(self):
+        """Without a password, list/stat work; open() requires a password."""
+        with copy_test_file("encrypted-hello.7z") as path:
+            with SevenZipMountSource(path, indexFilePath=":memory:") as mount_source:
+                assert mount_source._contentLocked  # pylint: disable=protected-access
+                info = mount_source.lookup("/secret.txt")
+                assert info is not None
+                assert info.size > 0
+                with pytest.raises(SevenZipError, match="password"):
+                    mount_source.open(info)
 
     def test_encrypted_string_password(self):
         with (
@@ -611,6 +620,68 @@ class TestSevenZipPersistentIndex:
                 passwords=["secret"],
             ) as mount_source:
                 assert mount_source.open(mount_source.lookup("/secret.txt")).read() == b"secret content\n"
+
+
+# ---------------------------------------------------------------------------
+# BCJ2 multi-stream + pack streaming
+# ---------------------------------------------------------------------------
+
+
+class TestSevenZipBcj2:
+    @pytest.mark.parametrize("name", ["bcj2-lzma.7z", "bcj2-default.7z"])
+    def test_bcj2_full_content(self, name):
+        path = _require_fixture(name)
+        ref = Path(_require_fixture("bcj2-x.bin")).read_bytes()
+        with open(path, "rb") as file:
+            info = parse_7z_archive(file)
+        assert any(METHOD_BCJ2 in f.methods() for f in info.folders)
+        assert info.folders[0].is_supported_for_open()
+
+        with SevenZipMountSource(path, indexFilePath=":memory:") as mount_source:
+            data = mount_source.open(mount_source.lookup("/x.bin")).read()
+            assert data == ref
+
+    def test_factory_opens_bcj2(self):
+        with copy_test_file("bcj2-lzma.7z") as path:
+            ms = open_mount_source(path, indexFilePath=":memory:")
+            try:
+                assert type(ms).__name__ == "SevenZipMountSource"
+                ref = Path(find_test_file("bcj2-x.bin")).read_bytes()
+                assert ms.open(ms.lookup("/x.bin")).read() == ref
+            finally:
+                ms.close()
+
+
+class TestSevenZipPackStreaming:
+    def test_file_pack_source_matches_bytes(self):
+        path = _require_fixture("lzma2-two-files-and-medium.7z")
+        with open(path, "rb") as file:
+            info = parse_7z_archive(file)
+            entry = next(e for e in info.files if e.size > 0)
+            file.seek(entry.pack_offset)
+            blob = file.read(entry.pack_size)
+            source = FilePackSource(file, entry.pack_offset, entry.pack_size)
+            assert source.size() == entry.pack_size
+            assert source.as_bytes() == blob
+            assert source.read_at(10, 50) == blob[10:60]
+
+    def test_streaming_decoder_uses_file_pack_source(self):
+        path = _require_fixture("lzma2-two-files-and-medium.7z")
+        with SevenZipMountSource(
+            path,
+            indexFilePath=":memory:",
+            sevenZipSmallFolderThreshold=0,
+            sevenZipChunkSize=64 * 1024,
+        ) as mount_source:
+            medium = mount_source.lookup("/medium.bin")
+            with mount_source.open(medium) as file:
+                assert file.read(16) == b"X" * 16
+                file.seek(medium.size - 16)
+                assert file.read() == b"X" * 16
+            # Decoder should not hold a full materialised packed copy for large folders.
+            decoder = next(iter(mount_source._streamDecoders.values()))  # pylint: disable=protected-access
+            assert decoder.packed == b""  # PackSource path leaves this empty
+            assert decoder._pack_size > 0  # pylint: disable=protected-access
 
 
 # ---------------------------------------------------------------------------

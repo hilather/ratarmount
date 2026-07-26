@@ -2,7 +2,10 @@
 
 This module intentionally avoids third-party 7z libraries so ratarmount can
 build indexes with real pack-stream offsets for random access. Decompression
-of common codecs (Copy, LZMA, LZMA2) uses the stdlib ``lzma`` module.
+of common codecs (Copy, LZMA, LZMA2, Deflate, BZip2, BCJ/Delta chains, BCJ2)
+uses the stdlib ``lzma`` / ``zlib`` / ``bz2`` modules plus a pure-Python BCJ2
+decoder. Packed data can be served from file regions (and AES-CBC range
+decrypt) so multi-GB solid folders need not be fully loaded into RAM.
 """
 
 from __future__ import annotations
@@ -219,6 +222,9 @@ class Folder:
             return coders[1:]
         return coders
 
+    def has_bcj2(self) -> bool:
+        return any(c.method == METHOD_BCJ2 for c in self.coders)
+
     def is_supported_for_open(self, *, allow_encrypted: bool = False) -> bool:
         """Return whether this folder can be opened with the current decoder set."""
         if not self.coders:
@@ -238,7 +244,24 @@ class Folder:
         ):
             return True
         # Native liblzma filter chains (e.g. BCJ + LZMA2).
-        return _coders_are_native_lzma_chain(coders)
+        if _coders_are_native_lzma_chain(coders):
+            return True
+        # BCJ2 multi-stream folders (typically LZMA/LZMA2/Copy + BCJ2).
+        if any(c.method == METHOD_BCJ2 for c in coders):
+            for c in coders:
+                if c.method == METHOD_BCJ2:
+                    if c.num_in_streams != 4 or c.num_out_streams != 1:
+                        return False
+                elif c.method not in (
+                    METHOD_COPY,
+                    METHOD_LZMA,
+                    METHOD_LZMA2,
+                    METHOD_BZIP2,
+                    METHOD_DEFLATE,
+                ) and c.method not in _METHOD_TO_LZMA_FILTER_ID:
+                    return False
+            return True
+        return False
 
     def content_coder(self) -> Optional[Coder]:
         """Return the non-AES content coder, if this is a single-coder chain."""
@@ -787,25 +810,30 @@ def parse_aes_properties(properties: Optional[bytes]) -> AesProperties:
     return AesProperties(cycles=cycles, salt=salt, iv=iv)
 
 
-def aes_decrypt_7z(packed: bytes, properties: Optional[bytes], password: Union[str, bytes]) -> bytes:
-    """Decrypt a 7z AES-256-CBC packed stream."""
+def _password_to_utf16le(password: Union[str, bytes]) -> bytes:
+    if isinstance(password, str):
+        return password.encode("utf-16le")
+    try:
+        return password.decode("utf-8").encode("utf-16le")
+    except UnicodeDecodeError:
+        return password
+
+
+def _aes_key_iv(properties: Optional[bytes], password: Union[str, bytes]) -> tuple[bytes, bytes]:
     if _AES is None:
         raise SevenZipError(
             "Encrypted 7z support requires the 'pycryptodomex' package (Cryptodome). "
             "Install it with: pip install pycryptodomex"
         )
-    if isinstance(password, str):
-        password_bytes = password.encode("utf-16le")
-    else:
-        # Callers may pass utf-8 bytes of the password string; convert like py7zr/CLI.
-        try:
-            password_bytes = password.decode("utf-8").encode("utf-16le")
-        except UnicodeDecodeError:
-            password_bytes = password  # already opaque; try as-is
-
     props = parse_aes_properties(properties)
-    key = calculate_7z_key(password_bytes, props.cycles, props.salt)
-    cipher = _AES.new(key, _AES.MODE_CBC, props.iv)
+    key = calculate_7z_key(_password_to_utf16le(password), props.cycles, props.salt)
+    return key, props.iv
+
+
+def aes_decrypt_7z(packed: bytes, properties: Optional[bytes], password: Union[str, bytes]) -> bytes:
+    """Decrypt a 7z AES-256-CBC packed stream."""
+    key, iv = _aes_key_iv(properties, password)
+    cipher = _AES.new(key, _AES.MODE_CBC, iv)
 
     # Ciphertext must be a multiple of the AES block size. 7z pads packed data accordingly.
     if len(packed) == 0:
@@ -815,60 +843,214 @@ def aes_decrypt_7z(packed: bytes, properties: Optional[bytes], password: Union[s
     return cipher.decrypt(packed)
 
 
-def prepare_folder_packed(
-    folder: Folder,
-    packed: bytes,
-    password: Optional[Union[str, bytes]] = None,
-) -> tuple[Folder, bytes]:
-    """Strip a leading AES coder (if any) and return (content_folder, content_packed).
+def aes_decrypt_range(
+    ciphertext: bytes,
+    properties: Optional[bytes],
+    password: Union[str, bytes],
+    offset: int,
+    size: int,
+    *,
+    plain_limit: Optional[int] = None,
+) -> bytes:
+    """Decrypt a byte range from AES-CBC ciphertext without requiring prior plaintext.
 
-    For unencrypted folders this is a no-op. For AES+codec chains the packed bytes
-    are decrypted and a synthetic folder containing only the post-AES coders is
-    returned so the existing streaming decoder can run unchanged.
+    CBC random access uses the previous ciphertext block as IV (or the stream IV for
+    block 0), so solid encrypted folders need not fully decrypt to serve one range.
     """
+    if size <= 0:
+        return b""
+    key, iv = _aes_key_iv(properties, password)
+    if not ciphertext:
+        return b""
+    if len(ciphertext) % 16 != 0:
+        ciphertext = ciphertext + bytes(16 - (len(ciphertext) % 16))
+    limit = len(ciphertext) if plain_limit is None else min(plain_limit, len(ciphertext))
+    if offset >= limit:
+        return b""
+    size = min(size, limit - offset)
+    block = 16
+    start_block = offset // block
+    end = offset + size
+    end_block = (end + block - 1) // block
+    ct_slice = ciphertext[start_block * block : end_block * block]
+    if start_block == 0:
+        block_iv = iv
+    else:
+        block_iv = ciphertext[(start_block - 1) * block : start_block * block]
+    cipher = _AES.new(key, _AES.MODE_CBC, block_iv)
+    plain = cipher.decrypt(ct_slice)
+    local = offset - start_block * block
+    return plain[local : local + size]
+
+
+# ---------------------------------------------------------------------------
+# Pack sources: avoid loading multi-GB packed folders when only ranges are needed
+# ---------------------------------------------------------------------------
+
+
+class PackSource:
+    """Random-access view of a folder's packed bytes (possibly AES-wrapped)."""
+
+    def size(self) -> int:
+        raise NotImplementedError
+
+    def read_at(self, offset: int, size: int) -> bytes:
+        raise NotImplementedError
+
+    def as_bytes(self) -> bytes:
+        return self.read_at(0, self.size())
+
+
+class BytesPackSource(PackSource):
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def size(self) -> int:
+        return len(self._data)
+
+    def read_at(self, offset: int, size: int) -> bytes:
+        if size <= 0 or offset >= len(self._data):
+            return b""
+        return self._data[offset : offset + size]
+
+    def as_bytes(self) -> bytes:
+        return self._data
+
+
+class FilePackSource(PackSource):
+    """Read packed data from a file region under an optional lock."""
+
+    def __init__(self, fileobj: BinaryIO, offset: int, length: int, lock: Optional[object] = None):
+        self._fileobj = fileobj
+        self._offset = offset
+        self._length = length
+        self._lock = lock
+
+    def size(self) -> int:
+        return self._length
+
+    def read_at(self, offset: int, size: int) -> bytes:
+        if size <= 0 or offset >= self._length:
+            return b""
+        size = min(size, self._length - offset)
+        if self._lock is not None:
+            with self._lock:  # type: ignore[union-attr]
+                self._fileobj.seek(self._offset + offset)
+                return self._fileobj.read(size)
+        self._fileobj.seek(self._offset + offset)
+        return self._fileobj.read(size)
+
+
+class AesPackSource(PackSource):
+    """AES-CBC view over an underlying ciphertext PackSource (range-decrypt)."""
+
+    def __init__(
+        self,
+        inner: PackSource,
+        properties: Optional[bytes],
+        password: Union[str, bytes],
+        *,
+        plain_size: Optional[int] = None,
+    ):
+        self._inner = inner
+        self._properties = properties
+        self._password = password
+        # 7z may pad ciphertext; plain_size is the AES coder unpack size when known.
+        self._plain_size = plain_size if plain_size is not None else inner.size()
+
+    def size(self) -> int:
+        return self._plain_size
+
+    def read_at(self, offset: int, size: int) -> bytes:
+        if size <= 0 or offset >= self._plain_size:
+            return b""
+        size = min(size, self._plain_size - offset)
+        # Load covering ciphertext blocks (+ previous block for CBC IV).
+        block = 16
+        start_block = offset // block
+        end = offset + size
+        end_block = (end + block - 1) // block
+        ct_start = 0 if start_block == 0 else (start_block - 1) * block
+        ct_end = end_block * block
+        # Ciphertext may need padding to block size for the cipher API.
+        ct = self._inner.read_at(ct_start, ct_end - ct_start)
+        if len(ct) < ct_end - ct_start:
+            ct = ct + bytes((ct_end - ct_start) - len(ct))
+        if len(ct) % 16 != 0:
+            ct = ct + bytes(16 - (len(ct) % 16))
+        # Re-decrypt using aes_decrypt_range logic on this window.
+        # Build a synthetic full-enough buffer with correct IV chain.
+        key, stream_iv = _aes_key_iv(self._properties, self._password)
+        if start_block == 0:
+            block_iv = stream_iv
+            dec_ct = ct
+            plain_offset_in_dec = offset
+        else:
+            block_iv = ct[:16]
+            dec_ct = ct[16:]
+            plain_offset_in_dec = offset - start_block * block
+        if not dec_ct:
+            return b""
+        cipher = _AES.new(key, _AES.MODE_CBC, block_iv)
+        plain = cipher.decrypt(dec_ct)
+        return plain[plain_offset_in_dec : plain_offset_in_dec + size]
+
+    def as_bytes(self) -> bytes:
+        return self.read_at(0, self._plain_size)
+
+
+def make_pack_source(
+    folder: Folder,
+    packed_or_source: Union[bytes, PackSource],
+    password: Optional[Union[str, bytes]] = None,
+) -> tuple[Folder, PackSource]:
+    """Strip leading AES (if any) and return (content_folder, content_pack_source)."""
+    if isinstance(packed_or_source, (bytes, bytearray)):
+        source: PackSource = BytesPackSource(bytes(packed_or_source))
+    else:
+        source = packed_or_source
+
     if not folder.coders:
         raise SevenZipError("Folder has no coders")
 
     if folder.coders[0].method != METHOD_AES:
-        return folder, packed
+        return folder, source
 
     if password is None:
         raise SevenZipError("Password required for encrypted 7z folder")
 
-    decrypted = aes_decrypt_7z(packed, folder.coders[0].properties, password)
-
-    # Intermediate size is the AES coder's unpack size when present.
-    if folder.unpack_sizes:
-        intermediate_size = folder.unpack_sizes[0]
-        if intermediate_size <= len(decrypted):
-            decrypted = decrypted[:intermediate_size]
+    intermediate_size = folder.unpack_sizes[0] if folder.unpack_sizes else source.size()
+    aes_source = AesPackSource(
+        source, folder.coders[0].properties, password, plain_size=intermediate_size
+    )
 
     rest = folder.coders[1:]
     if not rest:
-        # AES-only: expose as Copy over decrypted bytes.
         content = Folder(
             coders=[Coder(method=METHOD_COPY)],
-            unpack_sizes=[len(decrypted)],
+            unpack_sizes=[aes_source.size()],
             has_crc=folder.has_crc,
             crc=folder.crc,
         )
-        return content, decrypted
+        return content, aes_source
 
-    if len(rest) == 1:
-        content_coder = rest[0]
-        if content_coder.method not in (
-            METHOD_COPY,
-            METHOD_LZMA,
-            METHOD_LZMA2,
-            METHOD_BZIP2,
-            METHOD_DEFLATE,
-        ) and content_coder.method not in _METHOD_TO_LZMA_FILTER_ID:
-            raise SevenZipError(f"Unsupported codec after AES: {content_coder.method.hex()}")
-    elif not _coders_are_native_lzma_chain(rest):
-        raise SevenZipError(f"Unsupported encrypted coder chain: {[c.method.hex() for c in folder.coders]}")
-
-    # Remaining unpack sizes belong to the content coder(s).
     content_unpack = folder.unpack_sizes[1:] if len(folder.unpack_sizes) > 1 else [folder.get_unpack_size()]
+    # After stripping AES, simple AES→codec chains have no remaining binds: the
+    # decrypted bytes are the single pack input of the content coders.
+    # Remap multi-coder binds by subtracting the AES coder's stream indices.
+    aes_in = folder.coders[0].num_in_streams
+    aes_out = folder.coders[0].num_out_streams
+    if len(rest) == 1 and rest[0].num_in_streams == 1 and rest[0].num_out_streams == 1:
+        new_binds: list[tuple[int, int]] = []
+        new_packed: list[int] = []
+    else:
+        new_binds = []
+        for iin, oout in folder.bind_pairs:
+            if oout < aes_out:
+                # Fed from AES output — becomes the virtual pack input after decrypt.
+                continue
+            new_binds.append((iin - aes_in, oout - aes_out))
+        new_packed = [i - aes_in for i in folder.packed_indices if i >= aes_in]
     content = Folder(
         coders=[
             Coder(
@@ -879,11 +1061,246 @@ def prepare_folder_packed(
             )
             for c in rest
         ],
+        bind_pairs=new_binds,
+        packed_indices=new_packed,
         unpack_sizes=content_unpack if content_unpack else [folder.get_unpack_size()],
         has_crc=folder.has_crc,
         crc=folder.crc,
     )
-    return content, decrypted
+    return content, aes_source
+
+
+def prepare_folder_packed(
+    folder: Folder,
+    packed: bytes,
+    password: Optional[Union[str, bytes]] = None,
+) -> tuple[Folder, bytes]:
+    """Strip a leading AES coder (if any) and return (content_folder, content_packed bytes).
+
+    Prefer :func:`make_pack_source` when you want to avoid materializing large packs.
+    """
+    content, source = make_pack_source(folder, packed, password=password)
+    return content, source.as_bytes()
+
+
+# ---------------------------------------------------------------------------
+# BCJ2 (x86 call/jump converter with 4 input streams)
+# ---------------------------------------------------------------------------
+
+_BCJ2_TOP = 1 << 24
+_BCJ2_NUM_BIT_MODEL_TOTAL_BITS = 11
+_BCJ2_BIT_MODEL_TOTAL = 1 << _BCJ2_NUM_BIT_MODEL_TOTAL_BITS
+_BCJ2_NUM_MOVE_BITS = 5
+_BCJ2_STREAM_MAIN = 0
+_BCJ2_STREAM_CALL = 1
+_BCJ2_STREAM_JUMP = 2
+_BCJ2_STREAM_RC = 3
+
+
+def bcj2_decode(main: bytes, call: bytes, jump: bytes, rc: bytes, out_size: int) -> bytes:
+    """Decode BCJ2 streams into the original x86 byte stream (full-buffer).
+
+    Port of 7-Zip's public-domain ``Bcj2Dec_Decode`` (simplified single-byte MAIN path).
+    Stream order: MAIN, CALL, JUMP, RC. Output size must equal
+    ``len(main) + len(call) + len(jump)`` for a complete stream.
+    """
+    streams = (main, call, jump, rc)
+    lims = tuple(len(s) for s in streams)
+    pos = [0, 0, 0, 0]
+    dest = bytearray()
+    ip = 0
+    temp = 0
+    range_ = 0
+    code = 0
+    probs = [_BCJ2_BIT_MODEL_TOTAL >> 1] * (2 + 256)
+
+    def read_be32(stream: int) -> int:
+        i = pos[stream]
+        if i + 4 > lims[stream]:
+            raise SevenZipError(f"BCJ2 stream {stream} truncated")
+        pos[stream] = i + 4
+        return struct.unpack(">I", streams[stream][i : i + 4])[0]
+
+    # Initialize range coder from the first 5 RC bytes (range starts at 0).
+    while range_ != 5:
+        if range_ == 1 and code != 0:
+            raise SevenZipError("BCJ2 RC data error during init")
+        if pos[_BCJ2_STREAM_RC] >= lims[_BCJ2_STREAM_RC]:
+            raise SevenZipError("BCJ2 RC truncated during init")
+        code = ((code << 8) | streams[_BCJ2_STREAM_RC][pos[_BCJ2_STREAM_RC]]) & 0xFFFFFFFF
+        pos[_BCJ2_STREAM_RC] += 1
+        range_ += 1
+    if code == 0xFFFFFFFF:
+        raise SevenZipError("BCJ2 invalid initial code")
+    range_ = 0xFFFFFFFF
+
+    while len(dest) < out_size:
+        if range_ < _BCJ2_TOP:
+            if pos[_BCJ2_STREAM_RC] >= lims[_BCJ2_STREAM_RC]:
+                break
+            range_ = (range_ << 8) & 0xFFFFFFFF
+            code = ((code << 8) | streams[_BCJ2_STREAM_RC][pos[_BCJ2_STREAM_RC]]) & 0xFFFFFFFF
+            pos[_BCJ2_STREAM_RC] += 1
+
+        if pos[_BCJ2_STREAM_MAIN] >= lims[_BCJ2_STREAM_MAIN]:
+            break
+
+        b = streams[_BCJ2_STREAM_MAIN][pos[_BCJ2_STREAM_MAIN]]
+        pos[_BCJ2_STREAM_MAIN] += 1
+        dest.append(b)
+        ip += 1
+        v = ((temp << 24) | b) & 0xFFFFFFFF
+        temp = v
+
+        # Marker: E8/E9 or 0F 8x (as in Bcj2.c ONE_ITER).
+        if ((b + (0x100 - 0xE8)) & 0xFE) != 0:
+            if (((v - (((0x0F << 24) + 0x80))) & ((((1 << 28) - 0x1) << 4))) != 0):
+                continue
+
+        c_bit = ((v + 0x17) >> 6) & 1
+        prob_idx = (((0 - c_bit) & ((v >> 24) & 0xFF)) + c_bit + ((v >> 5) & 1))
+        ttt = probs[prob_idx]
+        bound = (range_ >> _BCJ2_NUM_BIT_MODEL_TOTAL_BITS) * ttt
+        if code < bound:
+            range_ = bound
+            probs[prob_idx] = (ttt + ((_BCJ2_BIT_MODEL_TOTAL - ttt) >> _BCJ2_NUM_MOVE_BITS)) & 0xFFFF
+            continue
+
+        range_ -= bound
+        code = (code - bound) & 0xFFFFFFFF
+        probs[prob_idx] = (ttt - (ttt >> _BCJ2_NUM_MOVE_BITS)) & 0xFFFF
+
+        cj = (((v + 0x57) >> 6) & 1) + _BCJ2_STREAM_CALL
+        val = read_be32(cj)
+        val = (val - (ip + 4)) & 0xFFFFFFFF
+        ip += 4
+        dest.append(val & 0xFF)
+        dest.append((val >> 8) & 0xFF)
+        dest.append((val >> 16) & 0xFF)
+        dest.append((val >> 24) & 0xFF)
+        temp = val >> 24
+
+    if len(dest) < out_size:
+        raise SevenZipError(f"BCJ2 produced {len(dest)} bytes but expected {out_size}")
+    return bytes(dest[:out_size])
+
+
+def _decompress_single_coder(coder: Coder, packed: bytes, unpack_size: int) -> bytes:
+    if coder.method == METHOD_COPY:
+        if len(packed) < unpack_size:
+            raise SevenZipError("Copy-coded data shorter than unpack size")
+        return packed[:unpack_size]
+    if coder.method in (METHOD_LZMA, METHOD_LZMA2) or coder.method in _METHOD_TO_LZMA_FILTER_ID:
+        filters = build_native_filter_chain([coder])
+        return _lzma_decompress_raw(packed, filters, unpack_size)
+    if coder.method == METHOD_DEFLATE:
+        return zlib.decompress(packed, wbits=-15)[:unpack_size]
+    if coder.method == METHOD_BZIP2:
+        import bz2
+
+        return bz2.decompress(packed)[:unpack_size]
+    raise SevenZipError(f"Unsupported intermediate 7z method: {coder.method.hex()}")
+
+
+def decompress_complex_folder(
+    folder: Folder,
+    pack_streams: Sequence[bytes],
+) -> bytes:
+    """Decompress a multi-coder folder (notably BCJ2) given pack streams in PackInfo order."""
+    if not folder.coders:
+        raise SevenZipError("Folder has no coders")
+    if len(pack_streams) != len(folder.packed_indices) and not (
+        len(folder.packed_indices) == 0 and len(pack_streams) == 1
+    ):
+        # packed_indices empty implies single packed stream index discovered at parse time.
+        if folder.packed_indices and len(pack_streams) != len(folder.packed_indices):
+            raise SevenZipError(
+                f"Expected {len(folder.packed_indices)} pack streams, got {len(pack_streams)}"
+            )
+
+    total_in = folder.total_in_streams()
+    total_out = folder.total_out_streams()
+    in_base: list[int] = []
+    out_base: list[int] = []
+    ii = oo = 0
+    for coder in folder.coders:
+        in_base.append(ii)
+        out_base.append(oo)
+        ii += coder.num_in_streams
+        oo += coder.num_out_streams
+
+    in_data: list[Optional[bytes]] = [None] * total_in
+    out_data: list[Optional[bytes]] = [None] * total_out
+
+    packed_indices = folder.packed_indices
+    if not packed_indices and len(pack_streams) == 1:
+        # Single unbound input.
+        used = {pair[0] for pair in folder.bind_pairs}
+        for i in range(total_in):
+            if i not in used:
+                packed_indices = [i]
+                break
+    for pack_i, glob_in in enumerate(packed_indices):
+        if pack_i >= len(pack_streams):
+            raise SevenZipError("Missing pack stream for multi-coder folder")
+        in_data[glob_in] = pack_streams[pack_i]
+
+    remaining = set(range(len(folder.coders)))
+    progress = True
+    while remaining and progress:
+        progress = False
+        for ci in list(remaining):
+            coder = folder.coders[ci]
+            inputs: list[bytes] = []
+            ready = True
+            for j in range(coder.num_in_streams):
+                gin = in_base[ci] + j
+                bound_from: Optional[int] = None
+                for iin, oout in folder.bind_pairs:
+                    if iin == gin:
+                        bound_from = oout
+                        break
+                if bound_from is not None:
+                    if out_data[bound_from] is None:
+                        ready = False
+                        break
+                    inputs.append(out_data[bound_from])  # type: ignore[arg-type]
+                else:
+                    if in_data[gin] is None:
+                        ready = False
+                        break
+                    inputs.append(in_data[gin])  # type: ignore[arg-type]
+            if not ready:
+                continue
+
+            if coder.method == METHOD_BCJ2:
+                if len(inputs) != 4:
+                    raise SevenZipError(f"BCJ2 expects 4 inputs, got {len(inputs)}")
+                out_sz = folder.unpack_sizes[out_base[ci]]
+                out_data[out_base[ci]] = bcj2_decode(inputs[0], inputs[1], inputs[2], inputs[3], out_sz)
+            else:
+                if coder.num_in_streams != 1 or coder.num_out_streams != 1:
+                    raise SevenZipError(
+                        f"Unsupported complex intermediate coder {coder.method.hex()} "
+                        f"in={coder.num_in_streams} out={coder.num_out_streams}"
+                    )
+                out_sz = folder.unpack_sizes[out_base[ci]]
+                out_data[out_base[ci]] = _decompress_single_coder(coder, inputs[0], out_sz)
+            remaining.remove(ci)
+            progress = True
+
+    if remaining:
+        raise SevenZipError(f"Could not resolve coder graph; remaining={sorted(remaining)}")
+
+    used_outs = {bp[1] for bp in folder.bind_pairs}
+    primary = None
+    for i in range(total_out):
+        if i not in used_outs:
+            primary = i
+            break
+    if primary is None or out_data[primary] is None:
+        raise SevenZipError("No primary output stream in complex folder")
+    return out_data[primary]  # type: ignore[return-value]
 
 
 def _coders_are_native_lzma_chain(coders: Sequence[Coder]) -> bool:
@@ -992,16 +1409,20 @@ class StreamingFolderDecoder:
       - A pread near the start of a large member does not decompress the whole folder.
       - Solid multi-file folders share one progressive decode cursor + chunk cache.
       - Memory is bounded by ``max_cached_chunks * chunk_size`` (plus a small pending buffer).
+      - Packed data may come from a :class:`PackSource` (file region / AES range-decrypt)
+        so multi-GB solid folders need not be fully loaded into RAM.
 
     Backward seeks that miss the chunk cache restart decompression from the beginning
     of the packed stream (same complexity class as libarchive, but subsequent hits in
     the chunk cache are O(1)).
+
+    Multi-stream folders (BCJ2) are not streamed; use :func:`decompress_folder` instead.
     """
 
     def __init__(
         self,
         folder: Folder,
-        packed: bytes,
+        packed: Union[bytes, PackSource],
         *,
         chunk_size: int = 1024 * 1024,
         max_cached_chunks: int = 64,
@@ -1011,10 +1432,16 @@ class StreamingFolderDecoder:
         if max_cached_chunks < 1:
             raise ValueError("max_cached_chunks must be >= 1")
         self.folder = folder
-        self.packed = packed
+        if isinstance(packed, (bytes, bytearray)):
+            self._pack: PackSource = BytesPackSource(bytes(packed))
+            self.packed = bytes(packed)  # backward-compat attribute for tests
+        else:
+            self._pack = packed
+            self.packed = b""  # not fully materialised
         self.chunk_size = chunk_size
         self.max_cached_chunks = max_cached_chunks
         self.unpack_size = folder.get_unpack_size()
+        self._pack_size = self._pack.size()
         self._chunks: dict[int, bytes] = {}
         self._chunk_order: list[int] = []  # LRU: oldest at front
         # Progressive decode: _unpacked_pos is total bytes produced (including pending).
@@ -1034,6 +1461,9 @@ class StreamingFolderDecoder:
             self._method = METHOD_LZMA2  # treat as lzma-family streaming path
         # Bytes decoded so far that have been fully committed to chunks or pending.
         self._pending_base = 0  # unpacked offset of pending[0]
+
+    def _read_pack(self, offset: int, size: int) -> bytes:
+        return self._pack.read_at(offset, size)
 
     def _touch_chunk(self, index: int) -> None:
         if index in self._chunk_order:
@@ -1118,9 +1548,9 @@ class StreamingFolderDecoder:
             self._reset_decoder()
 
         if self._method == METHOD_COPY and self._native_filters is None:
-            target = min(want_unpacked_through, self.unpack_size, len(self.packed))
+            target = min(want_unpacked_through, self.unpack_size, self._pack_size)
             if self._unpacked_pos < target:
-                self._emit(self.packed[self._unpacked_pos : target])
+                self._emit(self._read_pack(self._unpacked_pos, target - self._unpacked_pos))
             return
 
         while self._unpacked_pos < want_unpacked_through and not self._finished:
@@ -1142,7 +1572,7 @@ class StreamingFolderDecoder:
                         self._finished = True
                     continue
 
-                if self._packed_pos >= len(self.packed):
+                if self._packed_pos >= self._pack_size:
                     try:
                         out = dec.decompress(b"", max_length=max_length)
                     except EOFError:
@@ -1154,7 +1584,7 @@ class StreamingFolderDecoder:
                         self._finished = True
                     continue
 
-                feed = self.packed[self._packed_pos : self._packed_pos + 65536]
+                feed = self._read_pack(self._packed_pos, 65536)
                 try:
                     out = dec.decompress(feed, max_length=max_length)
                 except EOFError:
@@ -1171,13 +1601,13 @@ class StreamingFolderDecoder:
                     self._packed_pos += len(feed)
                 if out:
                     self._emit(out)
-                elif self._packed_pos >= len(self.packed) and getattr(dec, "needs_input", True):
+                elif self._packed_pos >= self._pack_size and getattr(dec, "needs_input", True):
                     self._finished = True
 
             elif self._method == METHOD_DEFLATE:
                 assert self._decoder is not None
                 dec = self._decoder
-                if self._packed_pos >= len(self.packed):
+                if self._packed_pos >= self._pack_size:
                     try:
                         out = dec.flush()  # type: ignore[attr-defined]
                     except Exception:
@@ -1186,7 +1616,7 @@ class StreamingFolderDecoder:
                         self._emit(out)
                     self._finished = True
                     continue
-                feed = self.packed[self._packed_pos : self._packed_pos + 65536]
+                feed = self._read_pack(self._packed_pos, 65536)
                 # zlib supports max_length on decompress in 3.0+.
                 try:
                     out = dec.decompress(feed, max_length)  # type: ignore[call-arg]
@@ -1200,16 +1630,16 @@ class StreamingFolderDecoder:
                     self._packed_pos += len(feed)
                 if out:
                     self._emit(out)
-                elif self._packed_pos >= len(self.packed):
+                elif self._packed_pos >= self._pack_size:
                     self._finished = True
 
             elif self._method == METHOD_BZIP2:
                 assert self._decoder is not None
                 dec = self._decoder
-                if self._packed_pos >= len(self.packed):
+                if self._packed_pos >= self._pack_size:
                     self._finished = True
                     continue
-                feed = self.packed[self._packed_pos : self._packed_pos + 65536]
+                feed = self._read_pack(self._packed_pos, 65536)
                 try:
                     out = dec.decompress(feed)  # type: ignore[attr-defined]
                 except EOFError:
@@ -1235,7 +1665,7 @@ class StreamingFolderDecoder:
         end = min(self.unpack_size, start + length)
 
         if self._method == METHOD_COPY and self._native_filters is None:
-            return self.packed[start:end]
+            return self._read_pack(start, end - start)
 
         first_chunk = start // self.chunk_size
         last_chunk = (end - 1) // self.chunk_size
@@ -1292,16 +1722,41 @@ class StreamingFolderDecoder:
 
 def decompress_folder(
     folder: Folder,
-    packed: bytes,
+    packed: Union[bytes, PackSource],
     password: Optional[Union[str, bytes]] = None,
+    *,
+    pack_stream_sizes: Optional[Sequence[int]] = None,
 ) -> bytes:
-    """Decompress a folder's packed bytes to the primary unpack stream."""
-    content_folder, content_packed = prepare_folder_packed(folder, packed, password=password)
+    """Decompress a folder's packed bytes to the primary unpack stream.
+
+    ``pack_stream_sizes`` is required for multi-pack folders (e.g. BCJ2) when
+    ``packed`` is the concatenation of PackInfo streams in archive order.
+    """
+    content_folder, content_source = make_pack_source(folder, packed, password=password)
     if not content_folder.coders:
         raise SevenZipError("Folder has no coders")
 
     unpack_size = content_folder.get_unpack_size()
     coders = content_folder.coders
+
+    # Multi-coder / BCJ2 path.
+    if len(coders) > 1 and (
+        any(c.method == METHOD_BCJ2 for c in coders) or len(content_folder.packed_indices) > 1
+    ):
+        blob = content_source.as_bytes()
+        sizes = list(pack_stream_sizes) if pack_stream_sizes is not None else None
+        if sizes is None:
+            if content_folder.packed_indices and len(content_folder.packed_indices) > 1:
+                raise SevenZipError("pack_stream_sizes required for multi-pack folder")
+            sizes = [len(blob)]
+        streams: list[bytes] = []
+        off = 0
+        for sz in sizes:
+            streams.append(blob[off : off + sz])
+            off += sz
+        return decompress_complex_folder(content_folder, streams)
+
+    content_packed = content_source.as_bytes()
 
     if len(coders) == 1 and coders[0].method == METHOD_COPY:
         if len(content_packed) < unpack_size:
@@ -1477,5 +1932,6 @@ def method_names(methods: Sequence[bytes]) -> str:
         METHOD_BCJ_SPARC: "BCJ_SPARC",
         METHOD_BCJ_IA64: "BCJ_IA64",
         METHOD_DELTA: "Delta",
+        METHOD_BCJ2: "BCJ2",
     }
     return "+".join(names.get(m, m.hex()) for m in methods)

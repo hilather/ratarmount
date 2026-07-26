@@ -63,12 +63,30 @@ for p in (store, lzma, enc, outer, outer_enc):
     print(f"  {p.name:40} {p.stat().st_size:8} bytes")
 PY
 
-# Optional non-solid store via CLI (extra coverage when 7z is installed)
+# Optional non-solid store + BCJ2 via CLI (extra coverage when 7z is installed)
 if command -v 7z >/dev/null 2>&1 || command -v 7zz >/dev/null 2>&1 || command -v 7za >/dev/null 2>&1; then
   SEVEN=$(command -v 7z || command -v 7zz || command -v 7za)
   SRC="$OUT/_fixture_src"
   "$SEVEN" a -t7z -mx=0 -ms=off "$OUT/store-nonsolid-cli.7z" "$SRC/a.txt" "$SRC/b.txt" >/dev/null
   echo "  store-nonsolid-cli.7z (via $SEVEN)"
+  # BCJ2 multi-stream fixture (x86-like payload)
+  python3 - <<'PY' "$SRC"
+from pathlib import Path
+import sys
+src = Path(sys.argv[1])
+data = bytearray()
+for i in range(5000):
+    data += bytes([0xE8, i & 0xFF, (i >> 8) & 0xFF, (i >> 16) & 0xFF, (i >> 24) & 0xFF])
+    data += b"\x90" * 16
+    data += bytes([0xE9, (i * 3) & 0xFF, 0, 0, 0])
+    data += b"CODE" * 8
+(src / "x.bin").write_bytes(bytes(data))
+print(f"  wrote x.bin ({len(data)} bytes)")
+PY
+  "$SEVEN" a -t7z -m0=BCJ2 -m1=LZMA:d=64k -m2=LZMA:d=16k -m3=LZMA:d=16k \
+    -mb0:1 -mb0s1:2 -mb0s2:3 "$OUT/bcj2-lzma.7z" "$SRC/x.bin" >/dev/null
+  cp -f "$SRC/x.bin" "$OUT/bcj2-x.bin"
+  echo "  bcj2-lzma.7z + bcj2-x.bin (via $SEVEN)"
 fi
 
 echo "Done."

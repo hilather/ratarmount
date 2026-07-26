@@ -6,9 +6,12 @@ the archive from the beginning.
 
 Open support:
   - Store (Copy) members: true random access via StenciledFile
-  - LZMA / LZMA2 / Deflate / BZip2: streaming folder decode with a chunk cache
-    so large/solid members do not require holding the full unpacked folder in RAM
-  - Encrypted folders: not supported (falls back via factory to py7zr)
+  - LZMA / LZMA2 / Deflate / BZip2 / BCJ+LZMA: streaming folder decode with a
+    chunk cache; packed data is read from the file (and AES is range-decrypted)
+    so multi-GB solid folders need not fully load into RAM
+  - BCJ2 multi-stream folders: full-folder decode with shared cache
+  - Encrypted folders: AES-256 with passwords; without a password the archive
+    still mounts for metadata (list/stat) and open() fails until a password is given
 """
 
 from __future__ import annotations
@@ -25,13 +28,15 @@ from typing import IO, Optional, Union, cast  # noqa: I001 — Union used for pa
 from ratarmountcore.mountsource import FileInfo, MountSource
 from ratarmountcore.mountsource.SQLiteIndexMountSource import SQLiteIndexMountSource
 from ratarmountcore.sevenzip import (
+    FilePackSource,
+    PackSource,
     SevenZipArchiveInfo,
     SevenZipError,
     SevenZipFileEntry,
     StreamingFolderDecoder,
     decompress_folder,
+    make_pack_source,
     parse_7z_archive,
-    prepare_folder_packed,
 )
 from ratarmountcore.SQLiteIndex import SQLiteIndex
 from ratarmountcore.StenciledFile import RawStenciledFile, StenciledFile
@@ -171,6 +176,9 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         self._archive: Optional[SevenZipArchiveInfo] = None
         self.passwords: list[Union[str, bytes]] = list(options.get("passwords") or [])
         self._password: Optional[Union[str, bytes]] = None
+        # True when archive has encrypted content but no valid password was supplied:
+        # listing/stat work; open() raises until a password is available.
+        self._contentLocked = False
 
         # Small-folder full-cache (legacy path for tiny archives).
         self._folderCache: dict[int, bytes] = {}
@@ -210,7 +218,7 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         self._finalize_index(self._create_index)
 
     def _resolve_password(self) -> Optional[Union[str, bytes]]:
-        """Pick a working password for encrypted folders, or None if unencrypted."""
+        """Pick a working password for encrypted folders, or None if unencrypted / metadata-only."""
         assert self._archive is not None
         encrypted_folders = [f for f in self._archive.folders if f.is_encrypted()]
         if not encrypted_folders:
@@ -223,37 +231,65 @@ class SevenZipMountSource(SQLiteIndexMountSource):
                     f"Unsupported encrypted 7z coder chain: {[c.method.hex() for c in folder.coders]}"
                 )
 
-        candidates: list[Optional[Union[str, bytes]]] = [None, *self.passwords]
+        # No passwords provided: allow metadata-only mount (list/stat), lock content.
+        if not self.passwords:
+            self._contentLocked = True
+            logger.warning(
+                "7z archive contents are encrypted; mounting metadata only. "
+                "Pass passwords=[...] or --password to read file contents."
+            )
+            return None
+
         # Find a non-empty data entry to trial-decrypt.
         trial_entry = next((e for e in self._archive.files if e.folder_index is not None and e.size > 0), None)
         if trial_entry is None:
             # Hierarchy-only archive; accept first password if any.
-            return self.passwords[0] if self.passwords else None
+            return self.passwords[0]
 
         folder = self._archive.folders[trial_entry.folder_index]  # type: ignore[index]
-        packed = self._read_packed(trial_entry)
         last_error: Optional[Exception] = None
-        for password in candidates:
-            if password is None:
-                continue
+        for password in self.passwords:
             try:
-                content_folder, content_packed = prepare_folder_packed(folder, packed, password=password)
+                pack_source = self._folder_pack_source(trial_entry)
+                content_folder, content_source = make_pack_source(folder, pack_source, password=password)
                 # Ensure the content codec can actually produce bytes.
                 if content_folder.get_unpack_size() > 0:
-                    sample = decompress_folder(content_folder, content_packed)
+                    sample = decompress_folder(
+                        content_folder,
+                        content_source,
+                        pack_stream_sizes=self._pack_stream_sizes(trial_entry),
+                    )
                     if len(sample) != content_folder.get_unpack_size():
                         continue
+                self._contentLocked = False
                 return password
             except Exception as exception:  # noqa: BLE001 — trial passwords may fail loudly
                 last_error = exception
                 continue
 
-        if self.passwords:
-            raise SevenZipError(
-                f"Could not decrypt 7z archive with the provided password(s): {last_error}"
-            ) from last_error
         raise SevenZipError(
-            "7z archive contents are encrypted; pass passwords=[...] or use --password"
+            f"Could not decrypt 7z archive with the provided password(s): {last_error}"
+        ) from last_error
+
+    def _pack_stream_sizes(self, entry: SevenZipFileEntry) -> Optional[list[int]]:
+        """Return PackInfo sizes for this entry's folder, if multi-pack."""
+        assert self._archive is not None
+        if entry.folder_index is None or self._archive.pack_info is None:
+            return None
+        folder = self._archive.folders[entry.folder_index]
+        count = len(folder.packed_indices) if folder.packed_indices else 1
+        if count <= 1:
+            return None
+        start = entry.pack_stream_index
+        sizes = self._archive.pack_info.pack_sizes[start : start + count]
+        if len(sizes) != count:
+            raise SevenZipError("Pack stream sizes truncated for multi-pack folder")
+        return list(sizes)
+
+    def _folder_pack_source(self, entry: SevenZipFileEntry) -> PackSource:
+        """Pack source for a folder: file region (no full RAM load of multi-GB packs)."""
+        return FilePackSource(
+            self.fileObject, entry.pack_offset, entry.pack_size, lock=self.fileObjectLock
         )
 
     def _create_index(self) -> None:
@@ -264,22 +300,29 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         self.index.set_file_infos(rows)
 
     def _read_packed(self, entry: SevenZipFileEntry) -> bytes:
-        with self.fileObjectLock:
-            self.fileObject.seek(entry.pack_offset)
-            packed = self.fileObject.read(entry.pack_size)
-        if len(packed) != entry.pack_size:
+        """Materialise full packed folder bytes (prefer :meth:`_folder_pack_source` for streaming)."""
+        data = self._folder_pack_source(entry).as_bytes()
+        if len(data) != entry.pack_size:
             raise SevenZipError("Short read while reading 7z pack stream")
-        return packed
+        return data
 
     def _read_member_bytes(self, entry: SevenZipFileEntry) -> bytes:
         """Read full member contents (used for symlink targets at index time)."""
         if entry.size == 0 or entry.folder_index is None:
             return b""
         folder = self._archive.folders[entry.folder_index]  # type: ignore[index]
+        if folder.is_encrypted() and (self._contentLocked or self._password is None):
+            raise SevenZipError(
+                "Cannot read encrypted 7z member without a password; pass passwords=[...] or --password"
+            )
         if folder.is_copy_only() and not folder.is_encrypted():
             with self.fileObjectLock:
                 self.fileObject.seek(entry.pack_offset + entry.unpack_offset)
                 return self.fileObject.read(entry.size)
+        # BCJ2 / multi-pack: full-folder cache path.
+        if folder.has_bcj2() or (folder.packed_indices and len(folder.packed_indices) > 1):
+            folder_data = self._get_folder_bytes(entry)
+            return folder_data[entry.unpack_offset : entry.unpack_offset + entry.size]
         # Prefer streaming decoder so large solid folders are not fully loaded for a symlink.
         decoder = self._get_stream_decoder(entry)
         with self._streamDecoderLock:
@@ -295,10 +338,14 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         linkname = ""
         size = entry.size
         if stat.S_ISLNK(mode):
-            try:
-                linkname = self._read_member_bytes(entry).decode("utf-8", errors="surrogateescape")
-            except Exception as exception:
-                logger.warning("Failed to read symlink target for %s: %s", entry.path, exception)
+            if self._contentLocked:
+                # Encrypted metadata-only mount: cannot resolve symlink targets yet.
+                linkname = ""
+            else:
+                try:
+                    linkname = self._read_member_bytes(entry).decode("utf-8", errors="surrogateescape")
+                except Exception as exception:
+                    logger.warning("Failed to read symlink target for %s: %s", entry.path, exception)
             size = 0
 
         if entry.folder_index is not None:
@@ -346,7 +393,7 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         )
 
     def _get_folder_bytes(self, entry: SevenZipFileEntry) -> bytes:
-        """Full-folder decompress path for small folders."""
+        """Full-folder decompress path for small folders and BCJ2 multi-stream folders."""
         assert self._archive is not None
         if entry.folder_index is None:
             raise RatarmountError("Entry has no folder")
@@ -357,8 +404,13 @@ class SevenZipMountSource(SQLiteIndexMountSource):
                 return cached
 
         folder = self._archive.folders[entry.folder_index]
-        packed = self._read_packed(entry)
-        data = decompress_folder(folder, packed, password=self._password)
+        pack_source = self._folder_pack_source(entry)
+        data = decompress_folder(
+            folder,
+            pack_source,
+            password=self._password,
+            pack_stream_sizes=self._pack_stream_sizes(entry),
+        )
 
         with self._folderCacheLock:
             if len(self._folderCache) >= self._folderCacheMax:
@@ -377,11 +429,11 @@ class SevenZipMountSource(SQLiteIndexMountSource):
                 return decoder
 
         folder = self._archive.folders[entry.folder_index]
-        packed = self._read_packed(entry)
-        content_folder, content_packed = prepare_folder_packed(folder, packed, password=self._password)
+        pack_source = self._folder_pack_source(entry)
+        content_folder, content_source = make_pack_source(folder, pack_source, password=self._password)
         decoder = StreamingFolderDecoder(
             content_folder,
-            content_packed,
+            content_source,
             chunk_size=self._chunkSize,
             max_cached_chunks=self._maxCachedChunks,
         )
@@ -412,8 +464,10 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         folder = self._archive.folders[entry.folder_index]
         folder_size = folder.get_unpack_size()
 
-        # Small folders: full decompress is simpler and avoids stream overhead.
-        if folder_size <= self._smallFolderThreshold:
+        # BCJ2 / multi-pack folders: full-folder decode (shared cache). Streaming
+        # progressive decode does not apply to multi-input BCJ2 graphs.
+        multi_pack = bool(folder.packed_indices and len(folder.packed_indices) > 1)
+        if folder.has_bcj2() or multi_pack or folder_size <= self._smallFolderThreshold:
             folder_data = self._get_folder_bytes(entry)
             end = entry.unpack_offset + entry.size
             if end > len(folder_data):
@@ -440,6 +494,11 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         entry = self._find_entry(fileInfo)
         assert entry.folder_index is not None
         folder = self._archive.folders[entry.folder_index]  # type: ignore[index]
+
+        if folder.is_encrypted() and (self._contentLocked or self._password is None):
+            raise SevenZipError(
+                "Cannot open encrypted 7z member without a password; pass passwords=[...] or --password"
+            )
 
         allow_encrypted = (not folder.is_encrypted()) or (self._password is not None)
         if not folder.is_supported_for_open(allow_encrypted=allow_encrypted):
