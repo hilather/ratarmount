@@ -1,0 +1,23 @@
+WARC/1.0
+WARC-Type: warcinfo
+Content-Type: application/warc-fields
+WARC-Date: 2020-01-01T00:00:00Z
+WARC-Record-ID: <urn:uuid:00000000-0000-0000-0000-000000000001>
+Content-Length: 14
+
+software: test
+
+WARC/1.0
+WARC-Type: response
+WARC-Target-URI: http://example.com/hello.txt
+WARC-Date: 2020-01-01T00:00:01Z
+WARC-Record-ID: <urn:uuid:00000000-0000-0000-0000-000000000002>
+Content-Type: application/http;msgtype=response
+Content-Length: 56
+
+HTTP/1.1 200 OK
+Content-Type: text/plain
+
+hello warc
+
+

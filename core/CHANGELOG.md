@@ -2,6 +2,12 @@
 
 ## Feature
 
+ - Add stencil-based random-access backends preferred over libarchive for:
+   - **CPIO** (`CPIOMountSource`): newc, crc, odc, and binary variants
+   - **ISO 9660** (`ISO9660MountSource`): extent-based file open
+   - **WARC** (`WARCMountSource`): payload offsets from `Content-Length`
+   - **XAR** (`XARMountSource`): TOC heap offsets; stored and gzip/bzip2 members
+ - Shared `StenciledArchiveMountSource` base for offset+size archive formats.
  - Add custom `SevenZipMountSource` backend (`--use-backend sevenzip`) that parses 7z headers and stores
    real pack-stream offsets for archive-level random access. Supports Copy, LZMA, LZMA2, Deflate, and BZip2
    (including solid archives). Encrypted archives still fall back to py7zr. Preferred over libarchive for `.7z`.

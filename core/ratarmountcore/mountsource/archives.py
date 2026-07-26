@@ -7,9 +7,11 @@ from ratarmountcore.formats import FileFormatID
 from . import MountSource
 from .formats.ar import ARMountSource
 from .formats.asar import ASARMountSource
+from .formats.cpio import CPIOMountSource
 from .formats.ext4 import EXT4MountSource
 from .formats.fat import FATMountSource
 from .formats.html import HTMLMountSource
+from .formats.iso9660 import ISO9660MountSource
 from .formats.libarchive import LibarchiveMountSource
 from .formats.ogg import OGGMountSource
 from .formats.pdf import PDFMountSource
@@ -19,6 +21,8 @@ from .formats.sevenzip import SevenZipMountSource
 from .formats.sqlar import SQLARMountSource
 from .formats.squashfs import SquashFSMountSource
 from .formats.tar import SQLiteIndexedTar
+from .formats.warc import WARCMountSource
+from .formats.xar import XARMountSource
 from .formats.zip import ZipMountSource
 from .SQLiteIndexMountSource import SQLiteIndexMountSource
 
@@ -85,6 +89,10 @@ class ArchiveBackendInfo:
 # The keys are the backend names the user can specify with --backends or via prioritizedBackends arguments.
 ARCHIVE_BACKENDS: dict[str, ArchiveBackendInfo] = {
     "ar": ArchiveBackendInfo(ARMountSource, {FID.AR, FID.AR_THIN}, []),
+    "cpio": ArchiveBackendInfo(CPIOMountSource, {FID.CPIO}, []),
+    "iso9660": ArchiveBackendInfo(ISO9660MountSource, {FID.ISO9660}, []),
+    "warc": ArchiveBackendInfo(WARCMountSource, {FID.WARC}, []),
+    "xar": ArchiveBackendInfo(XARMountSource, {FID.XAR}, []),
     "rarfile": ArchiveBackendInfo(RarMountSource, {FID.RAR}, [('rarfile', 'rarfile')]),
     "tarfile": ArchiveBackendInfo(
         _open_tar_mount_source,
@@ -115,6 +123,7 @@ ARCHIVE_BACKENDS: dict[str, ArchiveBackendInfo] = {
         _open_libarchive_mount_source,
         {
             FID.CAB,
+            # Custom cpio/iso/warc/xar backends are preferred; libarchive remains a fallback.
             FID.XAR,
             FID.CPIO,
             FID.ISO9660,
