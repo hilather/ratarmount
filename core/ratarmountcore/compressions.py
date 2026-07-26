@@ -67,6 +67,16 @@ except Exception:
     libarchive = None  # type: ignore
 
 try:
+    import lz4.block  # noqa: F401  # pylint: disable=unused-import
+    import lz4.frame  # noqa: F401  # pylint: disable=unused-import
+
+    from .LZ4File import open_lz4_file
+except ImportError:
+
+    def open_lz4_file(fileobj, **kwargs):  # type: ignore
+        raise ImportError("Please install lz4 with: pip install lz4")
+
+try:
     from libarchive import file_reader as libarchive_file_reader
 except Exception:
 
@@ -117,6 +127,13 @@ COMPRESSION_BACKENDS: dict[str, CompressionBackendInfo] = {
         (lambda x, parallelization=1: indexed_zstd.IndexedZstdFile(x.fileno())),
         {FID.ZSTANDARD},
         [('indexed_zstd', 'indexed_zstd')],
+        'tarfile',
+    ),
+    # Seekable LZ4 frame reader with block index (preferred over libarchive for .lz4).
+    'lz4': CompressionBackendInfo(
+        (lambda x, parallelization=1: open_lz4_file(x)),
+        {FID.LZ4},
+        [('lz4', 'lz4')],
         'tarfile',
     ),
     'libarchive': CompressionBackendInfo(

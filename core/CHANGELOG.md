@@ -8,6 +8,8 @@
    - **WARC** (`WARCMountSource`): payload offsets from `Content-Length`
    - **XAR** (`XARMountSource`): TOC heap offsets; stored and gzip/bzip2 members
  - Shared `StenciledArchiveMountSource` base for offset+size archive formats.
+ - Add seekable **LZ4** frame backend (`IndexedLZ4File` / `--use-backend lz4`) with block index for
+   independent-block random access; preferred over libarchive for `.lz4` and `tar.lz4`.
  - Add custom `SevenZipMountSource` backend (`--use-backend sevenzip`) that parses 7z headers and stores
    real pack-stream offsets for archive-level random access. Supports Copy, LZMA, LZMA2, Deflate, and BZip2
    (including solid archives). Encrypted archives still fall back to py7zr. Preferred over libarchive for `.7z`.
@@ -24,8 +26,10 @@
    recursive 7z-in-7z (including AutoMountLayer), and on-disk index reload.
  - Add fixtures: `store-copy-two-files.7z`, `lzma2-two-files-and-medium.7z`, `encrypted-hello.7z`,
    `nested-inner-hello.7z`, `nested-encrypted-inner.7z`, `bcj-lzma2-x86.7z`,
-   `nested-tar-in-cpio.newc.cpio`, `simple-response.warc`.
+   `nested-tar-in-cpio.newc.cpio`, `simple-response.warc`,
+   `multiblock-independent.lz4`, `multiblock-dependent.lz4`.
  - Add `core/tests/test_store_archives.py` for CPIO/ISO/WARC/XAR/deb (including tar-in-cpio recursion).
+ - Add `core/tests/test_LZ4File.py` for LZ4 seek, skippable frames, and tar.lz4 mounting.
 
 
 # Version 0.11.1 built on 2026-05-19
