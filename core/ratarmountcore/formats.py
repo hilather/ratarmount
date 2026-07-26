@@ -407,7 +407,8 @@ COMPRESSION_FORMATS: dict[FileFormatID, FileFormatInfo] = {
     # https://refspecs.linuxbase.org/LSB_4.1.0/LSB-Core-generic/LSB-Core-generic/pkgformat.html
     FID.RPM: FileFormatInfo(['rpm'], b'\xed\xab\xee\xdb'),
     # https://en.wikipedia.org/wiki/Uuencoding
-    FID.UU: FileFormatInfo(['uu'], b'begin '),
+    # Classic "begin 644 name" and "begin-base64 644 name" both start with "begin".
+    FID.UU: FileFormatInfo(['uu'], b'begin'),
     # https://github.com/file/file/blob/master/magic/Magdir/compress
     FID.Z: FileFormatInfo(['Z'], b'\x1f\x9d'),
 }

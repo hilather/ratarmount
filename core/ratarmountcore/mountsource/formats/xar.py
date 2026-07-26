@@ -166,7 +166,15 @@ class XARMountSource(StenciledArchiveMountSource):
                     pass
             return super().open(fileInfo, buffering=buffering)
 
-        if style in ("application/x-gzip", "application/gzip", "application/x-bzip2"):
+        if style in (
+            "application/x-gzip",
+            "application/gzip",
+            "application/x-bzip2",
+            "application/x-xz",
+            "application/x-lzma",
+            "application/xz",
+            "application/lzma",
+        ):
             packed_size = fileInfo.size
             if "|packed:" in link:
                 try:
@@ -181,6 +189,14 @@ class XARMountSource(StenciledArchiveMountSource):
                 import bz2
 
                 data = bz2.decompress(packed)
+            elif style in ("application/x-xz", "application/xz"):
+                import lzma
+
+                data = lzma.decompress(packed, format=lzma.FORMAT_XZ)
+            elif style in ("application/x-lzma", "application/lzma"):
+                import lzma
+
+                data = lzma.decompress(packed, format=lzma.FORMAT_ALONE)
             else:
                 try:
                     data = zlib.decompress(packed)

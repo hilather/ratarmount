@@ -4,15 +4,20 @@ Each LZIP member is an independent LZMA stream with a 6-byte header and
 20-byte trailer. Members are indexed by walking the file using trailer
 ``member_size`` fields; seeking within a member restarts LZMA for that
 member only (or uses a cached full-member decompress).
+
+Packed data is read from the underlying file on demand — the full archive
+is not kept in RAM.
 """
 
 from __future__ import annotations
 
+import contextlib
 import io
 import lzma
 import struct
+import threading
 from dataclasses import dataclass
-from typing import IO, Optional, Union
+from typing import IO, Union
 
 from .utils import RatarmountError, overrides
 
@@ -40,65 +45,55 @@ def _dict_size_from_code(code: int) -> int:
     return max(4096, base - (base // 16) * frac)
 
 
-def _decompress_member(data: bytes, start: int, end: int, dict_code: int) -> bytes:
-    """Decompress one LZIP member given [start, end) slice of the file bytes."""
-    if end - start < _HEADER_SIZE + _TRAILER_SIZE:
+def _decompress_member_bytes(payload_and_framing: bytes, dict_code: int) -> bytes:
+    """Decompress one LZIP member buffer (header+payload+trailer)."""
+    if len(payload_and_framing) < _HEADER_SIZE + _TRAILER_SIZE:
         raise LzipError("LZIP member too small")
-    payload = data[start + _HEADER_SIZE : end - _TRAILER_SIZE]
+    payload = payload_and_framing[_HEADER_SIZE : len(payload_and_framing) - _TRAILER_SIZE]
     filters = [{"id": lzma.FILTER_LZMA1, "dict_size": _dict_size_from_code(dict_code), "lc": 3, "lp": 0, "pb": 2}]
     dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters)
     out = dec.decompress(payload)
     if not dec.eof:
-        try:
+        with contextlib.suppress(Exception):
             out += dec.decompress(b"")
-        except Exception:
-            pass
-    # Prefer trailer data_size if present
-    _crc, data_size, _member_size = struct.unpack("<IQQ", data[end - _TRAILER_SIZE : end])
-    if data_size and data_size != len(out):
-        # Trust decompressor output if trailer mismatches (still return out)
-        pass
     return out
 
 
-def index_lzip_file(fileobj: IO[bytes]) -> tuple[bytes, list[LzipMember]]:
+def index_lzip_file(fileobj: IO[bytes]) -> list[LzipMember]:
+    """Walk LZIP members using file seeks (does not retain full file bytes)."""
+    fileobj.seek(0, io.SEEK_END)
+    file_size = fileobj.tell()
     fileobj.seek(0)
-    data = fileobj.read()
-    if not data.startswith(LZIP_MAGIC):
-        raise LzipError("Not an LZIP file")
 
     members: list[LzipMember] = []
     pos = 0
     u_off = 0
-    while pos + _HEADER_SIZE + _TRAILER_SIZE <= len(data):
-        if data[pos : pos + 4] != LZIP_MAGIC:
+    while pos + _HEADER_SIZE + _TRAILER_SIZE <= file_size:
+        fileobj.seek(pos)
+        header = fileobj.read(_HEADER_SIZE)
+        if len(header) < _HEADER_SIZE or header[:4] != LZIP_MAGIC:
             break
-        version = data[pos + 4]
+        version = header[4]
         if version != 1:
             raise LzipError(f"Unsupported LZIP version: {version}")
-        dict_code = data[pos + 5]
-        # member_size is last 8 bytes of the member; but we need member end.
-        # For sequential parse: decompress to find stream end is hard.
-        # Instead read trailer by scanning: LZIP members store member_size so
-        # end = pos + member_size. We discover member_size by trying decompress
-        # with growing windows OR by reading trailer after successful decompress.
-        # Reliable approach used by many tools: the trailer is at pos+member_size-20,
-        # and member_size is written there. We can find the next LZIP magic or EOF.
-        # Sequential: decompress raw payload until EOS, then trailer is next 20 bytes.
+        dict_code = header[5]
+
         filters = [
             {"id": lzma.FILTER_LZMA1, "dict_size": _dict_size_from_code(dict_code), "lc": 3, "lp": 0, "pb": 2}
         ]
         dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters)
         cursor = pos + _HEADER_SIZE
-        plain = bytearray()
-        while cursor < len(data) and not dec.eof:
-            feed = data[cursor : cursor + 65536]
+        plain_len = 0
+        while cursor < file_size and not dec.eof:
+            fileobj.seek(cursor)
+            feed = fileobj.read(min(65536, file_size - cursor))
             if not feed:
                 break
             try:
-                plain.extend(dec.decompress(feed))
+                chunk = dec.decompress(feed)
             except lzma.LZMAError as exc:
                 raise LzipError(f"LZIP LZMA error: {exc}") from exc
+            plain_len += len(chunk)
             if dec.eof:
                 unused = len(dec.unused_data)
                 cursor += len(feed) - unused
@@ -106,15 +101,17 @@ def index_lzip_file(fileobj: IO[bytes]) -> tuple[bytes, list[LzipMember]]:
             cursor += len(feed)
         if not dec.eof:
             raise LzipError("LZIP member LZMA stream did not terminate")
-        if cursor + _TRAILER_SIZE > len(data):
+        if cursor + _TRAILER_SIZE > file_size:
             raise LzipError("Truncated LZIP trailer")
-        _crc, data_size, member_size = struct.unpack("<IQQ", data[cursor : cursor + _TRAILER_SIZE])
+        fileobj.seek(cursor)
+        trailer = fileobj.read(_TRAILER_SIZE)
+        _crc, data_size, member_size = struct.unpack("<IQQ", trailer)
         end = pos + member_size if member_size else cursor + _TRAILER_SIZE
-        if data_size and abs(data_size - len(plain)) > 0:
-            # still use plain length
-            data_size = len(plain)
-        else:
-            data_size = len(plain)
+        if not data_size:
+            data_size = plain_len
+        # Prefer decompressed length when trailer mismatches slightly
+        if abs(data_size - plain_len) > 0:
+            data_size = plain_len
         members.append(
             LzipMember(
                 start_offset=pos,
@@ -129,37 +126,52 @@ def index_lzip_file(fileobj: IO[bytes]) -> tuple[bytes, list[LzipMember]]:
 
     if not members:
         raise LzipError("No LZIP members found")
-    return data, members
+    return members
 
 
 class IndexedLzipFile(io.RawIOBase):
-    """Seekable read-only LZIP file."""
+    """Seekable read-only LZIP file backed by on-demand file reads."""
 
     def __init__(self, fileobj: Union[str, IO[bytes]], **_kwargs):
         super().__init__()
+        self._close_file = False
         if isinstance(fileobj, str):
-            with open(fileobj, "rb") as f:
-                self._data, self._members = index_lzip_file(f)
+            self._file: IO[bytes] = open(fileobj, "rb")
+            self._close_file = True
         else:
-            pos = fileobj.tell()
-            fileobj.seek(0)
-            self._data, self._members = index_lzip_file(fileobj)
-            fileobj.seek(pos)
+            # Keep a private handle if possible; else wrap given object under lock.
+            self._file = fileobj
+        self._lock = threading.Lock()
+        with self._lock:
+            if hasattr(self._file, "seek"):
+                pos = self._file.tell()
+                self._file.seek(0)
+            else:
+                pos = 0
+            self._members = index_lzip_file(self._file)
+            if hasattr(self._file, "seek"):
+                self._file.seek(pos)
         self._size = sum(m.uncompressed_size for m in self._members)
         self._pos = 0
         self._member_cache: dict[int, bytes] = {}
+        self._member_cache_max = 4
 
     @property
     def size(self) -> int:
         return self._size
 
     def _member_plain(self, index: int) -> bytes:
-        if index not in self._member_cache:
-            m = self._members[index]
-            self._member_cache[index] = _decompress_member(
-                self._data, m.start_offset, m.end_offset, m.dict_size_code
-            )
-        return self._member_cache[index]
+        if index in self._member_cache:
+            return self._member_cache[index]
+        m = self._members[index]
+        with self._lock:
+            self._file.seek(m.start_offset)
+            blob = self._file.read(m.end_offset - m.start_offset)
+        plain = _decompress_member_bytes(blob, m.dict_size_code)
+        if len(self._member_cache) >= self._member_cache_max:
+            self._member_cache.pop(next(iter(self._member_cache)))
+        self._member_cache[index] = plain
+        return plain
 
     def _find(self, pos: int) -> tuple[int, int]:
         for i, m in enumerate(self._members):
@@ -224,6 +236,13 @@ class IndexedLzipFile(io.RawIOBase):
         n = len(data)
         b[:n] = data
         return n
+
+    @overrides(io.RawIOBase)
+    def close(self) -> None:
+        self._member_cache.clear()
+        if self._close_file:
+            self._file.close()
+        super().close()
 
 
 def open_lzip_file(fileobj: Union[str, IO[bytes]], **kwargs) -> IndexedLzipFile:

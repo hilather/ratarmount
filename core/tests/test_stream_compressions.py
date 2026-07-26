@@ -76,6 +76,23 @@ class TestCompressZ:
             assert detect_compression(raw) == FID.Z
 
 
+class TestUU:
+    def test_classic_uu(self):
+        path = _require("simple.uu")
+        expected = b"hello world from uu\n" * 5
+        _assert_seekable_plain(path, expected, "IndexedUUFile")
+
+    def test_base64_uu(self):
+        path = _require("simple-base64.uu")
+        expected = b"hello world from uu\n" * 5
+        _assert_seekable_plain(path, expected, "IndexedUUFile")
+
+    def test_detect_uu(self):
+        path = _require("simple.uu")
+        with open(path, "rb") as raw:
+            assert detect_compression(raw) == FID.UU
+
+
 class TestLzip:
     def test_simple_lzip(self):
         path = _require("simple.lzip")

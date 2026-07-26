@@ -9,6 +9,7 @@ from .formats.ar import ARMountSource
 from .formats.asar import ASARMountSource
 from .formats.cab import CABMountSource
 from .formats.cpio import CPIOMountSource
+from .formats.rpm import RPMMountSource
 from .formats.ext4 import EXT4MountSource
 from .formats.fat import FATMountSource
 from .formats.html import HTMLMountSource
@@ -92,6 +93,7 @@ ARCHIVE_BACKENDS: dict[str, ArchiveBackendInfo] = {
     "ar": ArchiveBackendInfo(ARMountSource, {FID.AR, FID.AR_THIN}, []),
     "cab": ArchiveBackendInfo(CABMountSource, {FID.CAB}, []),
     "cpio": ArchiveBackendInfo(CPIOMountSource, {FID.CPIO}, []),
+    "rpm": ArchiveBackendInfo(RPMMountSource, {FID.RPM}, []),
     "iso9660": ArchiveBackendInfo(ISO9660MountSource, {FID.ISO9660}, []),
     "warc": ArchiveBackendInfo(WARCMountSource, {FID.WARC}, []),
     "xar": ArchiveBackendInfo(XARMountSource, {FID.XAR}, []),
@@ -159,8 +161,8 @@ ARCHIVE_BACKENDS: dict[str, ArchiveBackendInfo] = {
             FID.GZIP,
             FID.XZ,
             FID.ZSTANDARD,
-            # Intentionally no custom random-access backend (Tier D):
-            # grzip/lrzip (exotic), rpm (cpio payload better via nested open), uuencode.
+            # grzip/lrzip stay libarchive-only (exotic long-range codecs).
+            # rpm/uuencode have custom backends preferred above; kept as fallback.
             FID.GRZIP,
             FID.LRZIP,
             FID.LZ4,

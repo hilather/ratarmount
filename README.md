@@ -236,34 +236,19 @@ If a graphical user interface is wanted, give one of these a try:
  - **Rar** as provided by [rarfile](https://github.com/markokr/rarfile) by Marko Kreen. See also the [RAR 5.0 archive format](https://www.rarlab.com/technote.htm).
  - **SquashFS, AppImage, Snap, SIF** as provided by [PySquashfsImage](https://github.com/matteomattei/PySquashfsImage) by Matteo Mattei. There seems to be no authoritative, open format specification, only [this nicely-done reverse-engineered description](https://dr-emann.github.io/squashfs/squashfs.html), I assume based on the [source code](https://github.com/plougher/squashfs-tools). Note that [Snaps](https://snapcraft.io/docs/the-snap-format), [Appimages](https://github.com/AppImage/AppImageSpec/blob/master/draft.md#type-2-image-format), and [Singularity Image Format](https://github.com/apptainer/sif) are, or contain, SquashFS images, with an executable prepended for AppImages, and other data prepended for SIF files.
  - **Zip** as provided by [zipfile](https://docs.python.org/3/library/zipfile.html), which is distributed with Python itself. See also the [ZIP File Format Specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT).
- - **7z** via [libarchive](https://github.com/libarchive/libarchive) or [py7zr](https://github.com/miurahr/py7zr) for encrypted 7z archives by Hiroshi Miura.
+ - **7z** via a custom random-access backend (Copy, LZMA/LZMA2, Deflate, BZip2, BCJ/Delta chains, BCJ2, AES), with [libarchive](https://github.com/libarchive/libarchive) / [py7zr](https://github.com/miurahr/py7zr) as fallbacks for unsupported codecs.
+ - **CPIO, ISO 9660, WARC, XAR, CAB** (store/MSZIP), **AR** / **deb**, and **RPM** (payload → compression + CPIO) via custom stencil / compose backends preferred over libarchive.
  - **FAT12/FAT16/FAT32/VFAT** as provided by [PyFatFS](https://github.com/nathanhi/pyfatfs) by Nathan-J. Hirschauer. See also [Microsoft's FAT32 File System Specification](https://download.microsoft.com/download/1/6/1/161ba512-40e2-4cc9-843a-923143f3456c/fatgen103.doc).
  - **EXT4** as provided by [python-ext4](https://github.com/Eeems/python-ext4) by Nathaniel van Diepen. See also the [Linux kernel docs for EXT4](https://docs.kernel.org/filesystems/ext4/).
  - **SQLAR** via [CPython's](https://docs.python.org/3/library/sqlite3.html) [sqlite3](https://sqlite.org/) module or via the [Python3 bindings](https://github.com/coleifer/sqlcipher3) to [sqlcipher](https://www.zetetic.net/sqlcipher/) for encrypted archives.
  - **HTML** files with embedded data URLs, such as those created by [Firefox's Save Page WE extension](https://addons.mozilla.org/en-US/firefox/addon/save-page-we/) or similar ones. The base64-encoded embedded files are exposed via the virtual file system in subfolders based on `data-src` URLs in a similar manner to the [`Page Info -> Media`](https://support.mozilla.org/en-US/kb/firefox-page-info-window#w_media) functionality.
  - **Ratarmount Indexes** can also be mounted directly without the associated archive. This can be useful for viewing the file tree hierarchy in cases where the contents are not required, e.g., to search in indexes to archives stored in cold storage. A longer term goal of mine would be some kind metadata database with computed hashes, thumbnails, and others that can be mounted and searched, similar to the [locate family of commands](https://en.wikipedia.org/wiki/Locate_(Unix)) on Linux, but for archival usage, i.e., for disconnected media, and with recursion into archives, something like [Tracker](https://wiki.ubuntu.com/Tracker) but less [intrusive](https://unix.stackexchange.com/questions/694065/how-to-really-completely-disable-gnome-tracker) and for browsing, not just searching in the metadata, something like [iRods](https://irods.org/) but less complicated. (If anyone knows of such a tool or needs help with it, please contact me, e.g., via an issue.)
- - **Many Others** as provided by [libarchive](https://github.com/libarchive/libarchive) via [python-libarchive-c](https://github.com/Changaco/python-libarchive-c).
-   - Formats with tests:
-     [7z](https://github.com/ip7z/7zip/blob/main/DOC/7zFormat.txt),
-     ar,
-     [cab](https://download.microsoft.com/download/4/d/a/4da14f27-b4ef-4170-a6e6-5b1ef85b1baa/[ms-cab].pdf),
-     compress, cpio,
-     [iso](http://www.brankin.com/main/technotes/Notes_ISO9660.htm),
-     [lrzip](https://github.com/ckolivas/lrzip),
-     [lzma](https://www.7-zip.org/a/lzma-specification.7z),
-     [lz4](https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md),
-     [lzip](https://www.ietf.org/archive/id/draft-diaz-lzip-09.txt),
-     lzo,
-     [warc](https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.0/),
-     xar.
-   - Untested formats that might work or not: deb, grzip,
-     [rpm](https://refspecs.linuxbase.org/LSB_4.1.0/LSB-Core-generic/LSB-Core-generic/pkgformat.html),
-     [uuencoding](https://en.wikipedia.org/wiki/Uuencoding).
+ - **Stream compressions** with seekable custom backends when possible: gzip/bzip2 (rapidgzip / indexed_gzip), xz, zstd, lz4, lzop, lzip, lzma, compress (.Z), [uuencode](https://en.wikipedia.org/wiki/Uuencoding).
+ - **Remaining libarchive-only** formats (no performant random access): [lrzip](https://github.com/ckolivas/lrzip), grzip, CAB LZX/Quantum folders, and other long-tail libarchive formats.
    - Beware that libarchive has no performant random access to files and to file contents.
      In order to seek or open a file, in general, it needs to be assumed that the archive has to be parsed from the beginning.
      If you have a performance-critical use case for a format only supported via libarchive,
      then please open a feature request for a faster customized archive format implementation.
-     The hope would be to add suitable stream compressors such as "short"-distance LZ-based compressions to [rapidgzip](https://github.com/mxmlnkn/rapidgzip).
 
 
 # Benchmarks

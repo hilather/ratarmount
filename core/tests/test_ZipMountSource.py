@@ -184,3 +184,18 @@ def benchmark_fast_decryption():
 if __name__ == '__main__':
     benchmark_fast_zipfile_decryption()
     benchmark_fast_decryption()
+
+
+def test_store_members_use_stencil_when_possible():
+    path = find_test_file("folder-symlink.zip")
+    with ZipMountSource(path, indexFilePath=":memory:") as mount_source:
+        assert mount_source._storeDataOffsets  # pylint: disable=protected-access
+        info = mount_source.lookup("/foo/fighter/ufo")
+        assert info is not None
+        with mount_source.open(info) as file:
+            # StenciledFile or RawStenciledFile for STORE
+            assert "Stencil" in type(file).__name__ or file.read() == b"iriya\n"
+            file.seek(0)
+            assert file.read() == b"iriya\n"
+            file.seek(1)
+            assert file.read() == b"riya\n"

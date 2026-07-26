@@ -2,14 +2,17 @@ import contextlib
 import datetime
 import logging
 import stat
+import struct
 import sys
+import threading
 import zipfile
 from pathlib import Path
-from typing import IO, Optional, Union
+from typing import IO, Optional, Union, cast
 
 from ratarmountcore.mountsource import FileInfo, MountSource
 from ratarmountcore.mountsource.SQLiteIndexMountSource import SQLiteIndexMountSource
 from ratarmountcore.SQLiteIndex import SQLiteIndex
+from ratarmountcore.StenciledFile import RawStenciledFile, StenciledFile
 from ratarmountcore.utils import overrides
 
 try:
@@ -31,9 +34,23 @@ class ZipMountSource(SQLiteIndexMountSource):
         if isinstance(fileOrPath, Path):
             fileOrPath = str(fileOrPath)
         self.fileObject = zipfile.ZipFile(fileOrPath, 'r')
+        # Underlying archive stream for STORE stencils (path or ZipFile.fp).
+        self._archiveFile: Optional[IO[bytes]] = None
+        self._archiveLock = threading.Lock()
+        if isinstance(fileOrPath, str):
+            self._archivePath: Optional[str] = fileOrPath
+        else:
+            self._archivePath = None
+            self._archiveFile = fileOrPath if hasattr(fileOrPath, "seek") else getattr(self.fileObject, "fp", None)
 
         ZipMountSource._find_password(self.fileObject, options.get("passwords", []))
         self.files = {info.header_offset: info for info in self.fileObject.infolist()}
+        # header_offset → absolute data offset for uncompressed (STORE) members.
+        self._storeDataOffsets: dict[int, int] = {}
+        for info in self.fileObject.infolist():
+            if info.compress_type == zipfile.ZIP_STORED and not info.is_dir() and info.file_size > 0:
+                with contextlib.suppress(Exception):
+                    self._storeDataOffsets[info.header_offset] = self._local_data_offset(info)
 
         indexOptions = {
             'archiveFilePath': fileOrPath if isinstance(fileOrPath, str) else None,
@@ -43,6 +60,31 @@ class ZipMountSource(SQLiteIndexMountSource):
         self._finalize_index(
             lambda: self.index.set_file_infos([self._convert_to_row(info) for info in self.fileObject.infolist()])
         )
+
+    def _local_data_offset(self, info: "zipfile.ZipInfo") -> int:
+        """Absolute offset of file data after the local ZIP header."""
+        # Local header: 30 bytes fixed + filename + extra
+        # We trust ZipInfo.header_offset; filename length may differ from central dir
+        # (general purpose bit 11 etc.) — read the local header.
+        zf = self.fileObject
+        fp = zf.fp
+        assert fp is not None
+        with self._archiveLock:
+            pos = fp.tell()
+            try:
+                fp.seek(info.header_offset)
+                local = fp.read(30)
+                if len(local) < 30 or local[:4] != b"PK\x03\x04":
+                    # Fallback: central-dir name/extra lengths
+                    return info.header_offset + 30 + len(info.filename.encode(zf.metadata_encoding or "utf-8")) + len(
+                        info.extra or b""
+                    )
+                _sig, _ver, _flags, _method, _time, _date, _crc, _csize, _usize, nlen, elen = struct.unpack(
+                    "<IHHHHHIIIHH", local
+                )
+                return info.header_offset + 30 + nlen + elen
+            finally:
+                fp.seek(pos)
 
     def _convert_to_row(self, info: "zipfile.ZipInfo") -> tuple:
         mtime = datetime.datetime(*info.date_time, tzinfo=datetime.timezone.utc).timestamp() if info.date_time else 0
@@ -135,13 +177,59 @@ class ZipMountSource(SQLiteIndexMountSource):
         if fileObject := getattr(self, 'fileObject', None):
             fileObject.close()
 
+    def _open_store_stencil(self, info: "zipfile.ZipInfo", buffering: int) -> Optional[IO[bytes]]:
+        data_offset = self._storeDataOffsets.get(info.header_offset)
+        if data_offset is None or info.file_size <= 0:
+            return None
+        # Prefer opening a dedicated handle for path-based archives so ZipFile.fp is undisturbed.
+        if self._archivePath is not None:
+            archive = open(self._archivePath, "rb")
+            lock = threading.Lock()
+
+            def _close_archive():
+                archive.close()
+
+            if buffering == 0:
+                f = RawStenciledFile([(archive, data_offset, info.file_size)], lock)
+            else:
+                f = StenciledFile(
+                    [(archive, data_offset, info.file_size)],
+                    lock,
+                    bufferSize=65536 if buffering < 0 else buffering,
+                )
+            # Close underlying archive when stencil closes
+            original_close = f.close
+
+            def close_and_release():
+                original_close()
+                _close_archive()
+
+            f.close = close_and_release  # type: ignore[method-assign]
+            return cast(IO[bytes], f)
+
+        fp = self._archiveFile or getattr(self.fileObject, "fp", None)
+        if fp is None:
+            return None
+        if buffering == 0:
+            return cast(IO[bytes], RawStenciledFile([(fp, data_offset, info.file_size)], self._archiveLock))
+        return cast(
+            IO[bytes],
+            StenciledFile(
+                [(fp, data_offset, info.file_size)],
+                self._archiveLock,
+                bufferSize=65536 if buffering < 0 else buffering,
+            ),
+        )
+
     @overrides(MountSource)
     def open(self, fileInfo: FileInfo, buffering=-1) -> IO[bytes]:
-        # I do not see any obvious option to zipfile.ZipFile to apply the specified buffer size.
         info = self.files[SQLiteIndex.get_index_userdata(fileInfo.userdata).offsetheader]
         assert isinstance(info, zipfile.ZipInfo)
-        # CPython's zipfile module does handle multiple file objects being opened and reading from the
-        # same underlying file object concurrently by using a _SharedFile class that even includes a lock.
-        # Very nice!
+        # True random access for STORE (uncompressed) members via file stencil.
+        if info.compress_type == zipfile.ZIP_STORED and not info.is_dir():
+            stenciled = self._open_store_stencil(info, buffering)
+            if stenciled is not None:
+                return stenciled
+        # Deflate / encrypted / etc.: zipfile handles per-member inflate.
         # https://github.com/python/cpython/blob/a87c46eab3c306b1c5b8a072b7b30ac2c50651c0/Lib/zipfile/__init__.py#L1569
         return self.fileObject.open(info, 'r')  # https://github.com/pauldmccarthy/indexed_gzip/issues/85

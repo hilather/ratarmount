@@ -217,6 +217,93 @@ class TestXAR:
             finally:
                 ms.close()
 
+    def test_xar_xz_member_open(self):
+        """Synthetic XAR-style open path for xz-encoded members (via linkname encoding)."""
+        import lzma
+        import io as _io
+        import tempfile
+        from ratarmountcore.mountsource import FileInfo
+        from ratarmountcore.SQLiteIndex import SQLiteIndexedTarUserData
+
+        # Build a tiny fake "heap" file with xz payload; use XARMountSource.open logic via stub.
+        plain = b"xz-payload-hello-world\n" * 10
+        packed = lzma.compress(plain, format=lzma.FORMAT_XZ)
+        with tempfile.NamedTemporaryFile(suffix=".bin") as tmp:
+            tmp.write(packed)
+            tmp.flush()
+            # Minimal XARMountSource-like open using real class with crafted FileInfo is heavy;
+            # unit-test the encoding branch by mounting a handcrafted xar if available,
+            # else call open path through a temporary XAR built by rewriting single-file is hard.
+            # Directly exercise decompress branch:
+            from ratarmountcore.mountsource.formats.xar import XARMountSource
+
+            # Create a minimal in-memory archive: store xz bytes as file with xar-enc link.
+            # Easier: open XARMountSource on a real empty? Skip if we can test via monkeypatch.
+            # Build a trivial StenciledArchive with one row by subclassing.
+            class _X(XARMountSource):
+                def __init__(self, path, packed_len):
+                    # Bypass parse: open file and finalize with one row
+                    from ratarmountcore.mountsource.formats.stenciled import make_file_row
+                    import stat as st
+
+                    def build_rows(fileobj):
+                        return [
+                            make_file_row(
+                                path="",
+                                name="xz.txt",
+                                header_offset=0,
+                                data_offset=0,
+                                size=len(plain),
+                                mtime=0,
+                                mode=0o644 | st.S_IFREG,
+                                linkname=f"xar-enc:application/x-xz|packed:{packed_len}",
+                            )
+                        ]
+
+                    from ratarmountcore.mountsource.formats.stenciled import StenciledArchiveMountSource
+
+                    StenciledArchiveMountSource.__init__(
+                        self, path, backendName="XARMountSource", build_rows=build_rows, indexFilePath=":memory:"
+                    )
+
+            with _X(tmp.name, len(packed)) as ms:
+                info = ms.lookup("/xz.txt")
+                assert info is not None
+                data = ms.open(info).read()
+                assert data == plain
+
+
+# ---------------------------------------------------------------------------
+# RPM
+# ---------------------------------------------------------------------------
+
+
+class TestRPM:
+    def test_tiny_gzip_cpio_rpm(self):
+        path = _require("tiny-gzip-cpio.rpm")
+        from ratarmountcore.mountsource.formats.rpm import RPMMountSource, parse_rpm_payload_location
+
+        with open(path, "rb") as f:
+            offset, size, compressor = parse_rpm_payload_location(f)
+        assert offset > 0 and size > 0
+        assert compressor == "gzip"
+
+        with RPMMountSource(path, indexFilePath=":memory:") as mount_source:
+            info = mount_source.lookup("/bar")
+            assert info is not None
+            with mount_source.open(info) as file:
+                assert file.read() == b"foo\n"
+                file.seek(1)
+                assert file.read() == b"oo\n"
+
+    def test_factory_prefers_rpm(self):
+        with copy_test_file("tiny-gzip-cpio.rpm") as path:
+            ms = open_mount_source(path, indexFilePath=":memory:")
+            try:
+                assert type(ms).__name__ == "RPMMountSource"
+            finally:
+                ms.close()
+
 
 # ---------------------------------------------------------------------------
 # CAB
@@ -326,6 +413,39 @@ class TestCAB:
         cab[36 + 6 : 36 + 8] = struct.pack("<H", 3)  # LZX
         with pytest.raises(CABError, match="not supported"):
             CABMountSource(io.BytesIO(bytes(cab)), indexFilePath=":memory:")
+
+    def test_mszip_multiblock_with_history(self):
+        """Multi-CFDATA MSZIP folder: second block may depend on 32 KiB history."""
+        # Build a folder stream large enough to force 2 blocks (~32k each) under MSZIP.
+        # Our synthetic writer currently emits one block; construct two CK+deflate blocks manually.
+        plain1 = b"A" * 1000 + b"MARKER1" + b"B" * 1000
+        plain2 = b"C" * 500 + b"MARKER2" + b"D" * 500
+        # Compress as independent CK blocks (still valid if no cross-block refs) + chained history path.
+        def mszip_block(data: bytes) -> bytes:
+            c = zlib.compressobj(level=9, wbits=-15)
+            return b"CK" + c.compress(data) + c.flush()
+
+        b1 = mszip_block(plain1)
+        b2 = mszip_block(plain2)
+        # Build CAB with 2 CFDATA for one MSZIP folder, one file spanning both.
+        stream = plain1 + plain2
+        files = [("big.txt", stream)]
+        # Manual CAB (same layout as _write_cab but multi CFDATA)
+        cffile = struct.pack("<IIHHHH", len(stream), 0, 0, 0x4E93, 0x64CA, 0x20) + b"big.txt\x00"
+        coff_files = 36 + 8
+        # CFDATA section: two blocks
+        cfdata = b""
+        for blk, un in ((b1, len(plain1)), (b2, len(plain2))):
+            cfdata += struct.pack("<IHH", 0, len(blk), un) + blk
+        cfdata_off = coff_files + len(cffile)
+        header = struct.pack("<4sIIIII", b"MSCF", 0, cfdata_off + len(cfdata), 0, coff_files, 0)
+        header += struct.pack("<BBHHHHH", 3, 1, 1, 1, 0, 0x1234, 0)
+        cffolder = struct.pack("<IHH", cfdata_off, 2, TCOMP_TYPE_MSZIP)
+        cab = header + cffolder + cffile + cfdata
+        with CABMountSource(io.BytesIO(cab), indexFilePath=":memory:") as ms:
+            data = ms.open(ms.lookup("/big.txt")).read()
+            assert data == stream
+            assert b"MARKER1" in data and b"MARKER2" in data
 
 
 # ---------------------------------------------------------------------------

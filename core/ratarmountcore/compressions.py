@@ -99,6 +99,7 @@ except ImportError:
 
 from .LzipFile import open_lzip_file  # noqa: E402
 from .LZMAFile import open_lzma_file  # noqa: E402
+from .UUFile import open_uu_file  # noqa: E402
 
 try:
     from libarchive import file_reader as libarchive_file_reader
@@ -182,6 +183,13 @@ COMPRESSION_BACKENDS: dict[str, CompressionBackendInfo] = {
         (lambda x, parallelization=1: open_lzma_file(x)),
         {FID.LZMA},
         [],  # stdlib lzma
+        'tarfile',
+    ),
+    # Uuencode: one-shot decode to seekable buffer (preferred over libarchive).
+    'uuencode': CompressionBackendInfo(
+        (lambda x, parallelization=1: open_uu_file(x)),
+        {FID.UU},
+        [],
         'tarfile',
     ),
     'libarchive': CompressionBackendInfo(

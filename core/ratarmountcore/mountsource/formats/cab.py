@@ -225,30 +225,31 @@ def parse_cab_archive(fileobj: IO[bytes]) -> CABArchive:
 
 
 def _mszip_decompress_block(block: bytes, uncompressed_size: int, history: bytes) -> bytes:
-    """Decompress one MSZIP CFDATA payload, using prior folder window as zlib dictionary."""
+    """Decompress one MSZIP CFDATA payload, using prior folder window as zlib dictionary when available."""
     if len(block) < 2 or block[:2] != b"CK":
         raise CABError("Invalid MSZIP block (missing CK signature)")
     payload = block[2:]
-    try:
+
+    def _raw_inflate(data: bytes, max_out: int) -> bytes:
         dobj = zlib.decompressobj(wbits=-15)
-        if history:
-            # MSZIP preserves a 32 KiB history window across blocks in a folder.
-            dobj.set_dictionary(history[-_MSZIP_WINDOW:])
-        out = dobj.decompress(payload, uncompressed_size)
+        out = dobj.decompress(data, max_out)
         out += dobj.flush()
-        if len(out) < uncompressed_size:
-            # Some writers omit a full flush; accept exact size when available.
-            pass
-        return out[:uncompressed_size] if uncompressed_size else out
-    except zlib.error as exc:
-        # Fallback without dictionary (single-block / independent streams)
+        return out[:max_out] if max_out else out
+
+    # Prefer dictionary when the platform supports it (MSZIP 32 KiB window across blocks).
+    if history and hasattr(zlib.decompressobj(wbits=-15), "set_dictionary"):
         try:
             dobj = zlib.decompressobj(wbits=-15)
+            dobj.set_dictionary(history[-_MSZIP_WINDOW:])
             out = dobj.decompress(payload, uncompressed_size)
             out += dobj.flush()
             return out[:uncompressed_size] if uncompressed_size else out
-        except zlib.error as exc2:
-            raise CABError(f"MSZIP decompress failed: {exc}") from exc2
+        except (zlib.error, AttributeError):
+            pass
+    try:
+        return _raw_inflate(payload, uncompressed_size)
+    except zlib.error as exc:
+        raise CABError(f"MSZIP decompress failed: {exc}") from exc
 
 
 class CABMountSource(SQLiteIndexMountSource):

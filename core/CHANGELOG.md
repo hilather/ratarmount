@@ -29,8 +29,12 @@
  - Mount encrypted 7z archives **without a password** for metadata only (list/stat); `open()` requires
    `--password` / `passwords=`.
  - Accept py7zr 1.x (not only 1.0.x) for fallback when the custom backend cannot handle a codec.
- - Intentionally leave rare/complex formats on **libarchive** (no custom random-access backend):
-   **lrzip**, **grzip**, **rpm** (partial via libarchive), **uuencode**. CAB **LZX/Quantum** folders also fall back.
+ - Add seekable **uuencode** backend (`IndexedUUFile` / classic + `begin-base64`) preferred over libarchive.
+ - Add **RPMMountSource**: parse RPM lead/signature/header once, open payload via existing gzip/xz/zstd + `CPIOMountSource`.
+ - XAR: open **xz/lzma**-encoded members (in addition to stored/gzip/bzip2).
+ - ZIP: open **STORE** members via `StenciledFile` at local-header data offsets (deflate still uses zipfile).
+ - LZIP: index/open from file regions without keeping the full archive bytes in RAM.
+ - Intentionally leave rare/complex formats on **libarchive**: **lrzip**, **grzip**, CAB **LZX/Quantum**.
 
 ## Development
 
