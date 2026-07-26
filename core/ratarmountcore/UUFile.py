@@ -7,11 +7,11 @@ libarchive re-scan on every open.
 
 from __future__ import annotations
 
-import binascii
 import base64
+import binascii
 import io
 import re
-from typing import IO, Union
+from typing import IO
 
 from .utils import RatarmountError, overrides
 
@@ -87,7 +87,7 @@ def decode_uu(data: bytes) -> tuple[bytes, str, int]:
 class IndexedUUFile(io.RawIOBase):
     """Seekable read-only view of a uuencode file payload."""
 
-    def __init__(self, fileobj: Union[str, IO[bytes]], **_kwargs):
+    def __init__(self, fileobj: str | IO[bytes], **_kwargs):
         super().__init__()
         if isinstance(fileobj, str):
             raw = open(fileobj, "rb").read()
@@ -139,5 +139,5 @@ class IndexedUUFile(io.RawIOBase):
         super().close()
 
 
-def open_uu_file(fileobj: Union[str, IO[bytes]], **kwargs) -> IndexedUUFile:
+def open_uu_file(fileobj: str | IO[bytes], **kwargs) -> IndexedUUFile:
     return IndexedUUFile(fileobj, **kwargs)

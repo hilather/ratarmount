@@ -156,38 +156,38 @@ COMPRESSION_BACKENDS: dict[str, CompressionBackendInfo] = {
     ),
     # Seekable LZ4 frame reader with block index (preferred over libarchive for .lz4).
     'lz4': CompressionBackendInfo(
-        (lambda x, parallelization=1: open_lz4_file(x)),
+        (lambda x, parallelization=1: cast(IO[bytes], open_lz4_file(x))),
         {FID.LZ4},
         [('lz4', 'lz4')],
         'tarfile',
     ),
     'lzo': CompressionBackendInfo(
-        (lambda x, parallelization=1: open_lzo_file(x)),
+        (lambda x, parallelization=1: cast(IO[bytes], open_lzo_file(x))),
         {FID.LZOP},
         [],  # uses system liblzo2 via ctypes
         'tarfile',
     ),
     'compress': CompressionBackendInfo(
-        (lambda x, parallelization=1: open_compress_z_file(x)),
+        (lambda x, parallelization=1: cast(IO[bytes], open_compress_z_file(x))),
         {FID.Z},
         [('unlzw3', 'unlzw3')],
         'tarfile',
     ),
     'lzip': CompressionBackendInfo(
-        (lambda x, parallelization=1: open_lzip_file(x)),
+        (lambda x, parallelization=1: cast(IO[bytes], open_lzip_file(x))),
         {FID.LZIP},
         [],  # stdlib lzma
         'tarfile',
     ),
     'lzma': CompressionBackendInfo(
-        (lambda x, parallelization=1: open_lzma_file(x)),
+        (lambda x, parallelization=1: cast(IO[bytes], open_lzma_file(x))),
         {FID.LZMA},
         [],  # stdlib lzma
         'tarfile',
     ),
     # Uuencode: one-shot decode to seekable buffer (preferred over libarchive).
     'uuencode': CompressionBackendInfo(
-        (lambda x, parallelization=1: open_uu_file(x)),
+        (lambda x, parallelization=1: cast(IO[bytes], open_uu_file(x))),
         {FID.UU},
         [],
         'tarfile',

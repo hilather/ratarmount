@@ -6,15 +6,17 @@ import contextlib
 import os
 import stat
 import threading
-from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import IO, Optional, Union, cast
+from typing import IO, TYPE_CHECKING, Optional, Union, cast
 
 from ratarmountcore.mountsource import FileInfo, MountSource
 from ratarmountcore.mountsource.SQLiteIndexMountSource import SQLiteIndexMountSource
 from ratarmountcore.SQLiteIndex import SQLiteIndex
 from ratarmountcore.StenciledFile import RawStenciledFile, StenciledFile
 from ratarmountcore.utils import RatarmountError, overrides
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
 
 
 class StenciledArchiveMountSource(SQLiteIndexMountSource):
@@ -26,7 +28,7 @@ class StenciledArchiveMountSource(SQLiteIndexMountSource):
 
     def __init__(
         self,
-        fileOrPath: Union[str, IO[bytes], Path],
+        fileOrPath: str | IO[bytes] | Path,
         *,
         backendName: str,
         build_rows: Callable[[IO[bytes]], Iterable[tuple]],

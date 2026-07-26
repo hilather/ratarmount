@@ -4,7 +4,6 @@ import os
 import sys
 
 import pytest
-
 from helpers import find_test_file
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -22,7 +21,7 @@ def _require(name: str) -> str:
 
 def _assert_seekable_plain(path: str, expected: bytes, backend_name: str):
     with open(path, "rb") as raw:
-        decomp, _raw, comp = open_compressed_file(raw)
+        decomp, _raw, _comp = open_compressed_file(raw)
         assert type(decomp).__name__ == backend_name
         assert decomp.read() == expected
         decomp.seek(4)
@@ -34,7 +33,7 @@ def _assert_seekable_plain(path: str, expected: bytes, backend_name: str):
 class TestLZO:
     def test_simple_lzo(self):
         path = _require("simple.lzo")
-        from ratarmountcore.LZOFile import IndexedLZOFile, parse_lzop_file
+        from ratarmountcore.LZOFile import parse_lzop_file
 
         with open(path, "rb") as f:
             info = parse_lzop_file(f)

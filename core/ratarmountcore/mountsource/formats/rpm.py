@@ -223,7 +223,7 @@ def _open_payload_stream(
 class RPMMountSource(MountSource):
     """Mount an RPM by exposing its CPIO payload through CPIOMountSource."""
 
-    def __init__(self, fileOrPath: Union[str, IO[bytes], Path], **options) -> None:
+    def __init__(self, fileOrPath: str | IO[bytes] | Path, **options) -> None:
         if isinstance(fileOrPath, Path):
             fileOrPath = str(fileOrPath)
         self.isFileObject = not isinstance(fileOrPath, str)
@@ -261,7 +261,7 @@ class RPMMountSource(MountSource):
         return self._cpio.list_mode(path)
 
     @overrides(MountSource)
-    def lookup(self, path: str, fileVersion: int = 0) -> Optional[FileInfo]:
+    def lookup(self, path: str, fileVersion: int = 0) -> FileInfo | None:
         return self._cpio.lookup(path, fileVersion=fileVersion)
 
     @overrides(MountSource)

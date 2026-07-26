@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-import struct
+import contextlib
 import stat
-import zlib
+import struct
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable
-from pathlib import Path
-from typing import IO, Optional, Union
+import zlib
+from typing import IO, TYPE_CHECKING, Optional, Union
 
 from ratarmountcore.mountsource.formats.stenciled import StenciledArchiveMountSource, make_file_row
 from ratarmountcore.SQLiteIndex import SQLiteIndex
 from ratarmountcore.utils import RatarmountError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
 
 
 def _local(tag: str) -> str:
@@ -75,11 +78,6 @@ def _walk_xar_files(element: ET.Element, prefix: str, heap_offset: int, rows: li
         path, base = SQLiteIndex.normpath(full).rsplit("/", 1)
         # Encode encoding style into linkname for open() to detect compressed members.
         # Use size as uncompressed size for listing; stored open uses length when encoding is identity.
-        is_stored = encoding in (
-            "application/octet-stream",
-            "application/x-gzip",  # sometimes misused; treat carefully below
-            "",
-        )
         # XAR "encoding style" for none is typically application/octet-stream
         style = encoding
         rows.append(
@@ -137,7 +135,7 @@ def parse_xar_archive(fileobj: IO[bytes]) -> list[tuple]:
 
 
 class XARMountSource(StenciledArchiveMountSource):
-    def __init__(self, fileOrPath: Union[str, IO[bytes], Path], **options) -> None:
+    def __init__(self, fileOrPath: str | IO[bytes] | Path, **options) -> None:
         def build_rows(fileobj: IO[bytes]) -> Iterable[tuple]:
             fileobj.seek(0)
             return parse_xar_archive(fileobj)
@@ -177,10 +175,8 @@ class XARMountSource(StenciledArchiveMountSource):
         ):
             packed_size = fileInfo.size
             if "|packed:" in link:
-                try:
+                with contextlib.suppress(ValueError):
                     packed_size = int(link.rsplit("|packed:", 1)[1])
-                except ValueError:
-                    pass
             offset = _SQLiteIndex.get_index_userdata(fileInfo.userdata).offset
             with self.fileObjectLock:
                 self.fileObject.seek(offset)

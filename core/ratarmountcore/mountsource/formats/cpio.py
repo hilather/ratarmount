@@ -5,13 +5,15 @@ from __future__ import annotations
 import os
 import stat
 import struct
-from collections.abc import Iterable
-from pathlib import Path
-from typing import IO, Optional, Union
+from typing import IO, TYPE_CHECKING, Optional, Union
 
 from ratarmountcore.mountsource.formats.stenciled import StenciledArchiveMountSource, make_file_row
 from ratarmountcore.SQLiteIndex import SQLiteIndex
 from ratarmountcore.utils import RatarmountError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
 
 # newc/crc ASCII header is 110 bytes of hex digits after the 6-byte magic.
 _NEWC_HEADER_SIZE = 110
@@ -240,7 +242,7 @@ def parse_cpio_archive(fileobj: IO[bytes], encoding: str = "utf-8") -> list[tupl
 
 
 class CPIOMountSource(StenciledArchiveMountSource):
-    def __init__(self, fileOrPath: Union[str, IO[bytes], Path], **options) -> None:
+    def __init__(self, fileOrPath: str | IO[bytes] | Path, **options) -> None:
         encoding = options.get("encoding", "utf-8")
 
         def build_rows(fileobj: IO[bytes]) -> Iterable[tuple]:

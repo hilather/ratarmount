@@ -10,16 +10,19 @@ decrypt) so multi-GB solid folders need not be fully loaded into RAM.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import io
 import lzma
 import struct
 import zlib
-from collections.abc import Sequence
-from typing import BinaryIO, Optional, Union
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 from .utils import RatarmountError
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 try:
     from Cryptodome.Cipher import AES as _AES
@@ -182,7 +185,7 @@ class Coder:
     method: bytes
     num_in_streams: int = 1
     num_out_streams: int = 1
-    properties: Optional[bytes] = None
+    properties: bytes | None = None
 
 
 @dataclasses.dataclass
@@ -252,18 +255,22 @@ class Folder:
                 if c.method == METHOD_BCJ2:
                     if c.num_in_streams != 4 or c.num_out_streams != 1:
                         return False
-                elif c.method not in (
-                    METHOD_COPY,
-                    METHOD_LZMA,
-                    METHOD_LZMA2,
-                    METHOD_BZIP2,
-                    METHOD_DEFLATE,
-                ) and c.method not in _METHOD_TO_LZMA_FILTER_ID:
+                elif (
+                    c.method
+                    not in (
+                        METHOD_COPY,
+                        METHOD_LZMA,
+                        METHOD_LZMA2,
+                        METHOD_BZIP2,
+                        METHOD_DEFLATE,
+                    )
+                    and c.method not in _METHOD_TO_LZMA_FILTER_ID
+                ):
                     return False
             return True
         return False
 
-    def content_coder(self) -> Optional[Coder]:
+    def content_coder(self) -> Coder | None:
         """Return the non-AES content coder, if this is a single-coder chain."""
         coders = self.content_coders()
         if len(coders) == 1:
@@ -278,7 +285,7 @@ class Folder:
 class PackInfo:
     pack_pos: int = 0
     pack_sizes: list[int] = dataclasses.field(default_factory=list)
-    crcs: list[Optional[int]] = dataclasses.field(default_factory=list)
+    crcs: list[int | None] = dataclasses.field(default_factory=list)
 
     @property
     def pack_positions(self) -> list[int]:
@@ -292,14 +299,14 @@ class PackInfo:
 class SubstreamsInfo:
     num_unpack_streams: list[int] = dataclasses.field(default_factory=list)
     unpack_sizes: list[int] = dataclasses.field(default_factory=list)
-    digests: list[Optional[int]] = dataclasses.field(default_factory=list)
+    digests: list[int | None] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
 class StreamsInfo:
-    pack_info: Optional[PackInfo] = None
+    pack_info: PackInfo | None = None
     folders: list[Folder] = dataclasses.field(default_factory=list)
-    substreams: Optional[SubstreamsInfo] = None
+    substreams: SubstreamsInfo | None = None
 
 
 @dataclasses.dataclass
@@ -315,7 +322,7 @@ class SevenZipFileEntry:
     is_empty_file: bool = False
     is_anti: bool = False
     # Location inside the archive (only for non-empty streams).
-    folder_index: Optional[int] = None
+    folder_index: int | None = None
     # Byte offset of this file's data inside the folder's unpacked stream.
     unpack_offset: int = 0
     # Absolute byte offset of the folder's first packed stream in the archive file.
@@ -332,7 +339,7 @@ class SevenZipArchiveInfo:
     after_header: int  # First byte after SignatureHeader (always 32 for normal archives).
     pack_pos_base: int  # after_header + pack_info.pack_pos
     folders: list[Folder]
-    pack_info: Optional[PackInfo]
+    pack_info: PackInfo | None
     files: list[SevenZipFileEntry]
     solid: bool = False
 
@@ -391,7 +398,9 @@ def _parse_folder(file: BinaryIO) -> Folder:
         if has_attrs:
             prop_size = _read_uint64(file)
             properties = _read_exact(file, prop_size)
-        folder.coders.append(Coder(method=method, num_in_streams=num_in, num_out_streams=num_out, properties=properties))
+        folder.coders.append(
+            Coder(method=method, num_in_streams=num_in, num_out_streams=num_out, properties=properties)
+        )
         total_in += num_in
         total_out += num_out
 
@@ -593,7 +602,7 @@ def _parse_files_info(file: BinaryIO) -> tuple[list[dict], list[bool], list[bool
     return files, empty_files, anti_files, [f.get("emptystream", False) for f in files]
 
 
-def _attributes_to_mode(attributes: Optional[int], is_dir: bool) -> int:
+def _attributes_to_mode(attributes: int | None, is_dir: bool) -> int:
     if attributes is not None and (attributes & _WINDOWS_UNIX_ATTR_MASK):
         # High 16 bits often store Unix mode when archive created on Unix.
         unix_mode = (attributes >> 16) & 0o7777
@@ -608,22 +617,20 @@ def _attributes_to_mode(attributes: Optional[int], is_dir: bool) -> int:
     return 0o644 | 0o100000
 
 
-def _is_directory_entry(filename: str, attributes: Optional[int], is_empty_stream: bool, is_empty_file: bool) -> bool:
+def _is_directory_entry(filename: str, attributes: int | None, is_empty_stream: bool, is_empty_file: bool) -> bool:
     if attributes is not None and (attributes & _WINDOWS_DIRECTORY_ATTR):
         return True
     if filename.endswith("/"):
         return True
     # Empty stream that is not an empty file is typically a directory.
-    if is_empty_stream and not is_empty_file:
-        return True
-    return False
+    return bool(is_empty_stream and not is_empty_file)
 
 
 def _build_file_entries(
     raw_files: list[dict],
     empty_files: list[bool],
     anti_files: list[bool],
-    streams: Optional[StreamsInfo],
+    streams: StreamsInfo | None,
     after_header: int,
 ) -> tuple[list[SevenZipFileEntry], bool]:
     if streams is None or streams.pack_info is None:
@@ -772,9 +779,7 @@ def calculate_7z_key(password: bytes, cycles: int, salt: bytes) -> bytes:
     salt_password = salt + password
     counter = 0
     for _ in range(stages):
-        digest.update(
-            b"".join(salt_password + (counter + i).to_bytes(8, "little") for i in range(rounds))
-        )
+        digest.update(b"".join(salt_password + (counter + i).to_bytes(8, "little") for i in range(rounds)))
         counter += rounds
     return digest.digest()[:32]
 
@@ -786,7 +791,7 @@ class AesProperties:
     iv: bytes  # always 16 bytes (zero-padded)
 
 
-def parse_aes_properties(properties: Optional[bytes]) -> AesProperties:
+def parse_aes_properties(properties: bytes | None) -> AesProperties:
     if not properties or len(properties) < 1:
         raise SevenZipError("Missing 7z AES properties")
     first = properties[0]
@@ -810,7 +815,7 @@ def parse_aes_properties(properties: Optional[bytes]) -> AesProperties:
     return AesProperties(cycles=cycles, salt=salt, iv=iv)
 
 
-def _password_to_utf16le(password: Union[str, bytes]) -> bytes:
+def _password_to_utf16le(password: str | bytes) -> bytes:
     if isinstance(password, str):
         return password.encode("utf-16le")
     try:
@@ -819,7 +824,7 @@ def _password_to_utf16le(password: Union[str, bytes]) -> bytes:
         return password
 
 
-def _aes_key_iv(properties: Optional[bytes], password: Union[str, bytes]) -> tuple[bytes, bytes]:
+def _aes_key_iv(properties: bytes | None, password: str | bytes) -> tuple[bytes, bytes]:
     if _AES is None:
         raise SevenZipError(
             "Encrypted 7z support requires the 'pycryptodomex' package (Cryptodome). "
@@ -830,7 +835,7 @@ def _aes_key_iv(properties: Optional[bytes], password: Union[str, bytes]) -> tup
     return key, props.iv
 
 
-def aes_decrypt_7z(packed: bytes, properties: Optional[bytes], password: Union[str, bytes]) -> bytes:
+def aes_decrypt_7z(packed: bytes, properties: bytes | None, password: str | bytes) -> bytes:
     """Decrypt a 7z AES-256-CBC packed stream."""
     key, iv = _aes_key_iv(properties, password)
     cipher = _AES.new(key, _AES.MODE_CBC, iv)
@@ -845,12 +850,12 @@ def aes_decrypt_7z(packed: bytes, properties: Optional[bytes], password: Union[s
 
 def aes_decrypt_range(
     ciphertext: bytes,
-    properties: Optional[bytes],
-    password: Union[str, bytes],
+    properties: bytes | None,
+    password: str | bytes,
     offset: int,
     size: int,
     *,
-    plain_limit: Optional[int] = None,
+    plain_limit: int | None = None,
 ) -> bytes:
     """Decrypt a byte range from AES-CBC ciphertext without requiring prior plaintext.
 
@@ -873,10 +878,7 @@ def aes_decrypt_range(
     end = offset + size
     end_block = (end + block - 1) // block
     ct_slice = ciphertext[start_block * block : end_block * block]
-    if start_block == 0:
-        block_iv = iv
-    else:
-        block_iv = ciphertext[(start_block - 1) * block : start_block * block]
+    block_iv = iv if start_block == 0 else ciphertext[(start_block - 1) * block : start_block * block]
     cipher = _AES.new(key, _AES.MODE_CBC, block_iv)
     plain = cipher.decrypt(ct_slice)
     local = offset - start_block * block
@@ -920,7 +922,7 @@ class BytesPackSource(PackSource):
 class FilePackSource(PackSource):
     """Read packed data from a file region under an optional lock."""
 
-    def __init__(self, fileobj: BinaryIO, offset: int, length: int, lock: Optional[object] = None):
+    def __init__(self, fileobj: BinaryIO, offset: int, length: int, lock: Any | None = None):
         self._fileobj = fileobj
         self._offset = offset
         self._length = length
@@ -934,7 +936,7 @@ class FilePackSource(PackSource):
             return b""
         size = min(size, self._length - offset)
         if self._lock is not None:
-            with self._lock:  # type: ignore[union-attr]
+            with self._lock:
                 self._fileobj.seek(self._offset + offset)
                 return self._fileobj.read(size)
         self._fileobj.seek(self._offset + offset)
@@ -947,10 +949,10 @@ class AesPackSource(PackSource):
     def __init__(
         self,
         inner: PackSource,
-        properties: Optional[bytes],
-        password: Union[str, bytes],
+        properties: bytes | None,
+        password: str | bytes,
         *,
-        plain_size: Optional[int] = None,
+        plain_size: int | None = None,
     ):
         self._inner = inner
         self._properties = properties
@@ -1001,8 +1003,8 @@ class AesPackSource(PackSource):
 
 def make_pack_source(
     folder: Folder,
-    packed_or_source: Union[bytes, PackSource],
-    password: Optional[Union[str, bytes]] = None,
+    packed_or_source: bytes | PackSource,
+    password: str | bytes | None = None,
 ) -> tuple[Folder, PackSource]:
     """Strip leading AES (if any) and return (content_folder, content_pack_source)."""
     if isinstance(packed_or_source, (bytes, bytearray)):
@@ -1020,9 +1022,7 @@ def make_pack_source(
         raise SevenZipError("Password required for encrypted 7z folder")
 
     intermediate_size = folder.unpack_sizes[0] if folder.unpack_sizes else source.size()
-    aes_source = AesPackSource(
-        source, folder.coders[0].properties, password, plain_size=intermediate_size
-    )
+    aes_source = AesPackSource(source, folder.coders[0].properties, password, plain_size=intermediate_size)
 
     rest = folder.coders[1:]
     if not rest:
@@ -1073,7 +1073,7 @@ def make_pack_source(
 def prepare_folder_packed(
     folder: Folder,
     packed: bytes,
-    password: Optional[Union[str, bytes]] = None,
+    password: str | bytes | None = None,
 ) -> tuple[Folder, bytes]:
     """Strip a leading AES coder (if any) and return (content_folder, content_packed bytes).
 
@@ -1153,12 +1153,11 @@ def bcj2_decode(main: bytes, call: bytes, jump: bytes, rc: bytes, out_size: int)
         temp = v
 
         # Marker: E8/E9 or 0F 8x (as in Bcj2.c ONE_ITER).
-        if ((b + (0x100 - 0xE8)) & 0xFE) != 0:
-            if (((v - (((0x0F << 24) + 0x80))) & ((((1 << 28) - 0x1) << 4))) != 0):
-                continue
+        if ((b + (0x100 - 0xE8)) & 0xFE) != 0 and ((v - (((0x0F << 24) + 0x80))) & (((1 << 28) - 0x1) << 4)) != 0:
+            continue
 
         c_bit = ((v + 0x17) >> 6) & 1
-        prob_idx = (((0 - c_bit) & ((v >> 24) & 0xFF)) + c_bit + ((v >> 5) & 1))
+        prob_idx = ((0 - c_bit) & ((v >> 24) & 0xFF)) + c_bit + ((v >> 5) & 1)
         ttt = probs[prob_idx]
         bound = (range_ >> _BCJ2_NUM_BIT_MODEL_TOTAL_BITS) * ttt
         if code < bound:
@@ -1209,14 +1208,14 @@ def decompress_complex_folder(
     """Decompress a multi-coder folder (notably BCJ2) given pack streams in PackInfo order."""
     if not folder.coders:
         raise SevenZipError("Folder has no coders")
-    if len(pack_streams) != len(folder.packed_indices) and not (
-        len(folder.packed_indices) == 0 and len(pack_streams) == 1
+    # packed_indices empty implies single packed stream index discovered at parse time.
+    if (
+        len(pack_streams) != len(folder.packed_indices)
+        and not (len(folder.packed_indices) == 0 and len(pack_streams) == 1)
+        and folder.packed_indices
+        and len(pack_streams) != len(folder.packed_indices)
     ):
-        # packed_indices empty implies single packed stream index discovered at parse time.
-        if folder.packed_indices and len(pack_streams) != len(folder.packed_indices):
-            raise SevenZipError(
-                f"Expected {len(folder.packed_indices)} pack streams, got {len(pack_streams)}"
-            )
+        raise SevenZipError(f"Expected {len(folder.packed_indices)} pack streams, got {len(pack_streams)}")
 
     total_in = folder.total_in_streams()
     total_out = folder.total_out_streams()
@@ -1229,8 +1228,8 @@ def decompress_complex_folder(
         ii += coder.num_in_streams
         oo += coder.num_out_streams
 
-    in_data: list[Optional[bytes]] = [None] * total_in
-    out_data: list[Optional[bytes]] = [None] * total_out
+    in_data: list[bytes | None] = [None] * total_in
+    out_data: list[bytes | None] = [None] * total_out
 
     packed_indices = folder.packed_indices
     if not packed_indices and len(pack_streams) == 1:
@@ -1255,7 +1254,7 @@ def decompress_complex_folder(
             ready = True
             for j in range(coder.num_in_streams):
                 gin = in_base[ci] + j
-                bound_from: Optional[int] = None
+                bound_from: int | None = None
                 for iin, oout in folder.bind_pairs:
                     if iin == gin:
                         bound_from = oout
@@ -1314,7 +1313,7 @@ def _coders_are_native_lzma_chain(coders: Sequence[Coder]) -> bool:
     return all(c.method in _METHOD_TO_LZMA_FILTER_ID for c in coders)
 
 
-def lzma2_filter_from_folder_properties(properties: Optional[bytes]) -> dict:
+def lzma2_filter_from_folder_properties(properties: bytes | None) -> dict:
     """Build the liblzma LZMA2 filter from **folder-level** 7z coder properties only.
 
     The 7z folder stores a single property byte encoding the dictionary size.
@@ -1328,12 +1327,9 @@ def lzma2_filter_from_folder_properties(properties: Optional[bytes]) -> dict:
     prop = properties[0]
     if prop > 40:
         raise SevenZipError(f"Invalid LZMA2 folder property byte: {prop}")
-    if prop == 40:
-        # 7z encodes "dict size = 2^32 - 1" as property 40; liblzma max is 1.5 GiB.
-        # Cap to the largest power-of-two dict liblzma accepts in practice.
-        dict_size = 1536 * 1024 * 1024
-    else:
-        dict_size = (2 | (prop & 1)) << (prop // 2 + 11)
+    # 7z encodes "dict size = 2^32 - 1" as property 40; liblzma max is 1.5 GiB.
+    # Cap to the largest power-of-two dict liblzma accepts in practice.
+    dict_size = 1536 * 1024 * 1024 if prop == 40 else (2 | (prop & 1)) << (prop // 2 + 11)
     filt["dict_size"] = dict_size
     return filt
 
@@ -1391,10 +1387,8 @@ def _lzma_decompress_raw(packed: bytes, filters: list[dict], unpack_size: int) -
         out = decompressor.decompress(packed)
     if len(out) < unpack_size and not decompressor.eof:
         # Feed remaining / finish.
-        try:
+        with contextlib.suppress(Exception):
             out += decompressor.decompress(b"", max_length=unpack_size - len(out))
-        except Exception:
-            pass
     if len(out) > unpack_size:
         out = out[:unpack_size]
     if len(out) < unpack_size:
@@ -1422,7 +1416,7 @@ class StreamingFolderDecoder:
     def __init__(
         self,
         folder: Folder,
-        packed: Union[bytes, PackSource],
+        packed: bytes | PackSource,
         *,
         chunk_size: int = 1024 * 1024,
         max_cached_chunks: int = 64,
@@ -1445,7 +1439,7 @@ class StreamingFolderDecoder:
         self._chunks: dict[int, bytes] = {}
         self._chunk_order: list[int] = []  # LRU: oldest at front
         # Progressive decode: _unpacked_pos is total bytes produced (including pending).
-        self._decoder: Optional[object] = None
+        self._decoder: Any | None = None
         self._packed_pos = 0
         self._unpacked_pos = 0
         self._pending = bytearray()
@@ -1453,7 +1447,7 @@ class StreamingFolderDecoder:
         coders = list(folder.coders)
         self._method = coders[0].method if coders else METHOD_COPY
         # Native multi-filter chain (BCJ+LZMA2, …). LZMA2 always uses folder-level props.
-        self._native_filters: Optional[list[dict]] = None
+        self._native_filters: list[dict] | None = None
         if len(coders) == 1 and coders[0].method in (METHOD_LZMA, METHOD_LZMA2):
             self._native_filters = build_native_filter_chain(coders)
         elif _coders_are_native_lzma_chain(coders):
@@ -1722,10 +1716,10 @@ class StreamingFolderDecoder:
 
 def decompress_folder(
     folder: Folder,
-    packed: Union[bytes, PackSource],
-    password: Optional[Union[str, bytes]] = None,
+    packed: bytes | PackSource,
+    password: str | bytes | None = None,
     *,
-    pack_stream_sizes: Optional[Sequence[int]] = None,
+    pack_stream_sizes: Sequence[int] | None = None,
 ) -> bytes:
     """Decompress a folder's packed bytes to the primary unpack stream.
 
@@ -1740,9 +1734,7 @@ def decompress_folder(
     coders = content_folder.coders
 
     # Multi-coder / BCJ2 path.
-    if len(coders) > 1 and (
-        any(c.method == METHOD_BCJ2 for c in coders) or len(content_folder.packed_indices) > 1
-    ):
+    if len(coders) > 1 and (any(c.method == METHOD_BCJ2 for c in coders) or len(content_folder.packed_indices) > 1):
         blob = content_source.as_bytes()
         sizes = list(pack_stream_sizes) if pack_stream_sizes is not None else None
         if sizes is None:
@@ -1766,9 +1758,7 @@ def decompress_folder(
     # Single LZMA/LZMA2 or multi-filter native chain (BCJ/Delta + LZMA2, …).
     # LZMA2 always uses the folder-level filter (dict_size); stream-internal
     # per-chunk property changes are handled by liblzma.
-    if (len(coders) == 1 and coders[0].method in (METHOD_LZMA, METHOD_LZMA2)) or _coders_are_native_lzma_chain(
-        coders
-    ):
+    if (len(coders) == 1 and coders[0].method in (METHOD_LZMA, METHOD_LZMA2)) or _coders_are_native_lzma_chain(coders):
         filters = build_native_filter_chain(coders)
         return _lzma_decompress_raw(content_packed, filters, unpack_size)
 
@@ -1790,7 +1780,9 @@ def decompress_folder(
     raise SevenZipError(f"Unsupported 7z compression method: {method.hex()}")
 
 
-def _parse_header_buffer(buffer: BinaryIO, archive_file: BinaryIO, after_header: int) -> tuple[Optional[StreamsInfo], list[dict], list[bool], list[bool]]:
+def _parse_header_buffer(
+    buffer: BinaryIO, archive_file: BinaryIO, after_header: int
+) -> tuple[StreamsInfo | None, list[dict], list[bool], list[bool]]:
     prop = buffer.read(1)
     if not prop:
         return None, [], [], []
@@ -1839,8 +1831,8 @@ def _parse_header_buffer(buffer: BinaryIO, archive_file: BinaryIO, after_header:
     return _parse_unpacked_header(decoded_buf)
 
 
-def _parse_unpacked_header(buffer: BinaryIO) -> tuple[Optional[StreamsInfo], list[dict], list[bool], list[bool]]:
-    streams: Optional[StreamsInfo] = None
+def _parse_unpacked_header(buffer: BinaryIO) -> tuple[StreamsInfo | None, list[dict], list[bool], list[bool]]:
+    streams: StreamsInfo | None = None
     raw_files: list[dict] = []
     empty_files: list[bool] = []
     anti_files: list[bool] = []
@@ -1883,7 +1875,9 @@ def parse_7z_archive(file: BinaryIO) -> SevenZipArchiveInfo:
 
     after_header = SIGNATURE_HEADER_SIZE
     if next_header_size == 0:
-        return SevenZipArchiveInfo(after_header=after_header, pack_pos_base=after_header, folders=[], pack_info=None, files=[])
+        return SevenZipArchiveInfo(
+            after_header=after_header, pack_pos_base=after_header, folders=[], pack_info=None, files=[]
+        )
 
     file.seek(after_header + next_header_offset)
     header_data = _read_exact(file, next_header_size)

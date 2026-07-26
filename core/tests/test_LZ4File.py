@@ -2,21 +2,16 @@
 
 import os
 import sys
-import tempfile
-from pathlib import Path
 
 import pytest
-
-from helpers import copy_test_file, find_test_file
+from helpers import find_test_file
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-lz4 = pytest.importorskip("lz4.frame")
-import lz4.frame  # noqa: E402
-
-from ratarmountcore.LZ4File import IndexedLZ4File, index_lz4_file  # noqa: E402
+pytest.importorskip("lz4.frame")
 from ratarmountcore.compressions import detect_compression, open_compressed_file  # noqa: E402
 from ratarmountcore.formats import FID  # noqa: E402
+from ratarmountcore.LZ4File import IndexedLZ4File  # noqa: E402
 from ratarmountcore.mountsource.compositing.automount import AutoMountLayer  # noqa: E402
 from ratarmountcore.mountsource.factory import open_mount_source  # noqa: E402
 
@@ -49,8 +44,6 @@ class TestIndexedLZ4File:
 
     def test_multiblock_independent(self):
         path = _require("multiblock-independent.lz4")
-        plain = Path(path).with_suffix(".plain")
-        # Reconstruct expected from compress of known pattern if sidecar missing
         with IndexedLZ4File(path) as file:
             assert file._frames[0].block_independence
             assert len(file._frames[0].blocks) > 1
@@ -83,7 +76,7 @@ class TestIndexedLZ4File:
         options = {"recursive": True, "indexFilePath": ":memory:", "clearIndexCache": True}
         # File is lz4-compressed tar
         with open(path, "rb") as raw:
-            decomp, _, comp = open_compressed_file(raw)
+            _decomp, _, comp = open_compressed_file(raw)
             assert comp == FID.LZ4
         base = open_mount_source(path, **options)
         try:

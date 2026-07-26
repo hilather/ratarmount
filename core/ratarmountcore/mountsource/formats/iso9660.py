@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import stat
 import struct
-from collections.abc import Iterable
-from pathlib import Path
-from typing import IO, Optional, Union
+from typing import IO, TYPE_CHECKING, Optional, Union
 
 from ratarmountcore.mountsource.formats.stenciled import StenciledArchiveMountSource, make_file_row
 from ratarmountcore.SQLiteIndex import SQLiteIndex
 from ratarmountcore.utils import RatarmountError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
 
 SECTOR = 2048
 PVD_OFFSET = 16 * SECTOR  # primary volume descriptor starts at sector 16
@@ -21,7 +23,7 @@ def _read_both_endian_u32(data: bytes, offset: int) -> int:
     return struct.unpack_from("<I", data, offset)[0]
 
 
-def _parse_directory_record(data: bytes, offset: int) -> Optional[dict]:
+def _parse_directory_record(data: bytes, offset: int) -> dict | None:
     if offset >= len(data):
         return None
     length = data[offset]
@@ -143,7 +145,7 @@ def parse_iso9660_archive(fileobj: IO[bytes]) -> list[tuple]:
 
 
 class ISO9660MountSource(StenciledArchiveMountSource):
-    def __init__(self, fileOrPath: Union[str, IO[bytes], Path], **options) -> None:
+    def __init__(self, fileOrPath: str | IO[bytes] | Path, **options) -> None:
         def build_rows(fileobj: IO[bytes]) -> Iterable[tuple]:
             fileobj.seek(0)
             return parse_iso9660_archive(fileobj)

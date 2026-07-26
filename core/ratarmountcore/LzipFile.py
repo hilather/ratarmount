@@ -17,7 +17,7 @@ import lzma
 import struct
 import threading
 from dataclasses import dataclass
-from typing import IO, Union
+from typing import IO
 
 from .utils import RatarmountError, overrides
 
@@ -78,9 +78,7 @@ def index_lzip_file(fileobj: IO[bytes]) -> list[LzipMember]:
             raise LzipError(f"Unsupported LZIP version: {version}")
         dict_code = header[5]
 
-        filters = [
-            {"id": lzma.FILTER_LZMA1, "dict_size": _dict_size_from_code(dict_code), "lc": 3, "lp": 0, "pb": 2}
-        ]
+        filters = [{"id": lzma.FILTER_LZMA1, "dict_size": _dict_size_from_code(dict_code), "lc": 3, "lp": 0, "pb": 2}]
         dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters)
         cursor = pos + _HEADER_SIZE
         plain_len = 0
@@ -132,7 +130,7 @@ def index_lzip_file(fileobj: IO[bytes]) -> list[LzipMember]:
 class IndexedLzipFile(io.RawIOBase):
     """Seekable read-only LZIP file backed by on-demand file reads."""
 
-    def __init__(self, fileobj: Union[str, IO[bytes]], **_kwargs):
+    def __init__(self, fileobj: str | IO[bytes], **_kwargs):
         super().__init__()
         self._close_file = False
         if isinstance(fileobj, str):
@@ -245,5 +243,5 @@ class IndexedLzipFile(io.RawIOBase):
         super().close()
 
 
-def open_lzip_file(fileobj: Union[str, IO[bytes]], **kwargs) -> IndexedLzipFile:
+def open_lzip_file(fileobj: str | IO[bytes], **kwargs) -> IndexedLzipFile:
     return IndexedLzipFile(fileobj, **kwargs)

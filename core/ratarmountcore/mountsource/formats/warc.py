@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import re
 import stat
-from collections.abc import Iterable
-from pathlib import Path
-from typing import IO, Union
+from typing import IO, TYPE_CHECKING, Union
 from urllib.parse import urlparse
 
 from ratarmountcore.mountsource.formats.stenciled import StenciledArchiveMountSource, make_file_row
 from ratarmountcore.SQLiteIndex import SQLiteIndex
 from ratarmountcore.utils import RatarmountError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
 
 _CONTENT_LENGTH_RE = re.compile(rb"(?im)^Content-Length:\s*(\d+)\s*$")
 _WARC_TYPE_RE = re.compile(rb"(?im)^WARC-Type:\s*(\S+)\s*$")
@@ -40,10 +42,7 @@ def _sanitize_name(name: str, used: dict[str, int]) -> str:
     if key in used:
         used[key] += 1
         stem, dot, ext = name.rpartition(".")
-        if dot and stem:
-            name = f"{stem}-{used[key]}.{ext}"
-        else:
-            name = f"{name}-{used[key]}"
+        name = f"{stem}-{used[key]}.{ext}" if dot and stem else f"{name}-{used[key]}"
     else:
         used[key] = 0
     return name
@@ -136,7 +135,7 @@ def parse_warc_archive(fileobj: IO[bytes]) -> list[tuple]:
 
 
 class WARCMountSource(StenciledArchiveMountSource):
-    def __init__(self, fileOrPath: Union[str, IO[bytes], Path], **options) -> None:
+    def __init__(self, fileOrPath: str | IO[bytes] | Path, **options) -> None:
         def build_rows(fileobj: IO[bytes]) -> Iterable[tuple]:
             fileobj.seek(0)
             return parse_warc_archive(fileobj)

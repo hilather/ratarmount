@@ -15,7 +15,7 @@ import io
 import logging
 import struct
 from dataclasses import dataclass
-from typing import IO, BinaryIO, Optional, Union
+from typing import IO
 
 from .utils import RatarmountError, overrides
 
@@ -63,7 +63,7 @@ class LZ4FrameInfo:
     block_independence: bool
     block_checksum: bool
     content_checksum: bool
-    content_size: Optional[int]
+    content_size: int | None
     blocks: list[LZ4BlockInfo]
     # Offset just past the end mark (and optional content checksum).
     end_offset: int
@@ -127,8 +127,8 @@ def parse_lz4_frame(fileobj: IO[bytes]) -> LZ4FrameInfo:
     # Header checksum (xxHash of descriptor) — 1 byte; we skip validation.
     _read_exact(fileobj, 1)
 
-    # Block maximum size from BD bits 4-5 (only informational for reading).
-    _max_block_size_code = (bd >> 4) & 0x07
+    # Block maximum size from BD bits 4-5 is informational only for reading.
+    _ = (bd >> 4) & 0x07
 
     blocks: list[LZ4BlockInfo] = []
     uncompressed_offset = 0
@@ -214,9 +214,7 @@ def parse_lz4_frame(fileobj: IO[bytes]) -> LZ4FrameInfo:
         fileobj.seek(end_offset)
 
     if content_size is not None and content_size != uncompressed_offset:
-        logger.debug(
-            "LZ4 content size header %s differs from sum of blocks %s", content_size, uncompressed_offset
-        )
+        logger.debug("LZ4 content size header %s differs from sum of blocks %s", content_size, uncompressed_offset)
 
     return LZ4FrameInfo(
         start_offset=start,
@@ -268,7 +266,7 @@ def index_lz4_file(fileobj: IO[bytes]) -> list[LZ4FrameInfo]:
 class IndexedLZ4File(io.RawIOBase):
     """Seekable read-only view of an LZ4 frame stream."""
 
-    def __init__(self, fileobj: Union[str, IO[bytes]], **_kwargs):
+    def __init__(self, fileobj: str | IO[bytes], **_kwargs):
         super().__init__()
         _require_lz4()
         self._close_file = False
@@ -287,7 +285,7 @@ class IndexedLZ4File(io.RawIOBase):
             total += frame.total_uncompressed
         self._pos = 0
         # Cache of last decompressed block: (frame_idx, block_idx, data)
-        self._block_cache: Optional[tuple[int, int, bytes]] = None
+        self._block_cache: tuple[int, int, bytes] | None = None
 
     @property
     def size(self) -> int:
@@ -459,6 +457,6 @@ class IndexedLZ4File(io.RawIOBase):
         super().close()
 
 
-def open_lz4_file(fileobj: Union[str, IO[bytes]], **kwargs) -> IndexedLZ4File:
+def open_lz4_file(fileobj: str | IO[bytes], **kwargs) -> IndexedLZ4File:
     """Open an LZ4 file as a seekable file object (API for COMPRESSION_BACKENDS)."""
     return IndexedLZ4File(fileobj, **kwargs)

@@ -23,7 +23,7 @@ import os
 import stat
 import threading
 from pathlib import Path
-from typing import IO, Optional, Union, cast  # noqa: I001 — Union used for passwords
+from typing import IO, BinaryIO, Optional, Union, cast  # noqa: I001 — Union used for passwords
 
 from ratarmountcore.mountsource import FileInfo, MountSource
 from ratarmountcore.mountsource.SQLiteIndexMountSource import SQLiteIndexMountSource
@@ -166,16 +166,16 @@ class SevenZipStreamingMemberFile(io.RawIOBase):
 
 
 class SevenZipMountSource(SQLiteIndexMountSource):
-    def __init__(self, fileOrPath: Union[str, IO[bytes], Path], **options) -> None:
+    def __init__(self, fileOrPath: str | IO[bytes] | Path, **options) -> None:
         if isinstance(fileOrPath, Path):
             fileOrPath = str(fileOrPath)
 
         self.isFileObject = not isinstance(fileOrPath, str)
         self.fileObject: IO[bytes] = open(fileOrPath, "rb") if isinstance(fileOrPath, str) else fileOrPath
         self.fileObjectLock = threading.Lock()
-        self._archive: Optional[SevenZipArchiveInfo] = None
-        self.passwords: list[Union[str, bytes]] = list(options.get("passwords") or [])
-        self._password: Optional[Union[str, bytes]] = None
+        self._archive: SevenZipArchiveInfo | None = None
+        self.passwords: list[str | bytes] = list(options.get("passwords") or [])
+        self._password: str | bytes | None = None
         # True when archive has encrypted content but no valid password was supplied:
         # listing/stat work; open() raises until a password is available.
         self._contentLocked = False
@@ -191,12 +191,10 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         self._streamDecoderMax = int(options.get("sevenZipStreamDecoderMax", 4))
         self._chunkSize = int(options.get("sevenZipChunkSize", _DEFAULT_CHUNK_SIZE))
         self._maxCachedChunks = int(options.get("sevenZipMaxCachedChunks", _DEFAULT_MAX_CACHED_CHUNKS))
-        self._smallFolderThreshold = int(
-            options.get("sevenZipSmallFolderThreshold", _DEFAULT_SMALL_FOLDER_THRESHOLD)
-        )
+        self._smallFolderThreshold = int(options.get("sevenZipSmallFolderThreshold", _DEFAULT_SMALL_FOLDER_THRESHOLD))
 
         try:
-            self._archive = parse_7z_archive(self.fileObject)
+            self._archive = parse_7z_archive(cast(BinaryIO, self.fileObject))
             self._password = self._resolve_password()
         except SevenZipError:
             if not self.isFileObject:
@@ -217,7 +215,7 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         super().__init__(**indexOptions)
         self._finalize_index(self._create_index)
 
-    def _resolve_password(self) -> Optional[Union[str, bytes]]:
+    def _resolve_password(self) -> str | bytes | None:
         """Pick a working password for encrypted folders, or None if unencrypted / metadata-only."""
         assert self._archive is not None
         encrypted_folders = [f for f in self._archive.folders if f.is_encrypted()]
@@ -227,9 +225,7 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         # Verify codec support up front.
         for folder in encrypted_folders:
             if not folder.is_supported_for_open(allow_encrypted=True):
-                raise SevenZipError(
-                    f"Unsupported encrypted 7z coder chain: {[c.method.hex() for c in folder.coders]}"
-                )
+                raise SevenZipError(f"Unsupported encrypted 7z coder chain: {[c.method.hex() for c in folder.coders]}")
 
         # No passwords provided: allow metadata-only mount (list/stat), lock content.
         if not self.passwords:
@@ -247,7 +243,7 @@ class SevenZipMountSource(SQLiteIndexMountSource):
             return self.passwords[0]
 
         folder = self._archive.folders[trial_entry.folder_index]  # type: ignore[index]
-        last_error: Optional[Exception] = None
+        last_error: Exception | None = None
         for password in self.passwords:
             try:
                 pack_source = self._folder_pack_source(trial_entry)
@@ -267,11 +263,9 @@ class SevenZipMountSource(SQLiteIndexMountSource):
                 last_error = exception
                 continue
 
-        raise SevenZipError(
-            f"Could not decrypt 7z archive with the provided password(s): {last_error}"
-        ) from last_error
+        raise SevenZipError(f"Could not decrypt 7z archive with the provided password(s): {last_error}") from last_error
 
-    def _pack_stream_sizes(self, entry: SevenZipFileEntry) -> Optional[list[int]]:
+    def _pack_stream_sizes(self, entry: SevenZipFileEntry) -> list[int] | None:
         """Return PackInfo sizes for this entry's folder, if multi-pack."""
         assert self._archive is not None
         if entry.folder_index is None or self._archive.pack_info is None:
@@ -289,7 +283,7 @@ class SevenZipMountSource(SQLiteIndexMountSource):
     def _folder_pack_source(self, entry: SevenZipFileEntry) -> PackSource:
         """Pack source for a folder: file region (no full RAM load of multi-GB packs)."""
         return FilePackSource(
-            self.fileObject, entry.pack_offset, entry.pack_size, lock=self.fileObjectLock
+            cast(BinaryIO, self.fileObject), entry.pack_offset, entry.pack_size, lock=self.fileObjectLock
         )
 
     def _create_index(self) -> None:
@@ -310,7 +304,8 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         """Read full member contents (used for symlink targets at index time)."""
         if entry.size == 0 or entry.folder_index is None:
             return b""
-        folder = self._archive.folders[entry.folder_index]  # type: ignore[index]
+        assert self._archive is not None
+        folder = self._archive.folders[entry.folder_index]
         if folder.is_encrypted() and (self._contentLocked or self._password is None):
             raise SevenZipError(
                 "Cannot read encrypted 7z member without a password; pass passwords=[...] or --password"
@@ -327,6 +322,7 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         decoder = self._get_stream_decoder(entry)
         with self._streamDecoderLock:
             return decoder.read_range(entry.unpack_offset, entry.size)
+
     def _convert_to_row(self, entry: SevenZipFileEntry, entry_index: int) -> tuple:
         path, name = SQLiteIndex.normpath(self.transform(entry.path)).rsplit("/", 1)
         mode = entry.mode
@@ -348,10 +344,7 @@ class SevenZipMountSource(SQLiteIndexMountSource):
                     logger.warning("Failed to read symlink target for %s: %s", entry.path, exception)
             size = 0
 
-        if entry.folder_index is not None:
-            header_offset = entry.pack_offset
-        else:
-            header_offset = (1 << 62) + entry_index
+        header_offset = entry.pack_offset if entry.folder_index is not None else (1 << 62) + entry_index
         data_offset = entry.unpack_offset
 
         # fmt: off
@@ -384,13 +377,14 @@ class SevenZipMountSource(SQLiteIndexMountSource):
             if entry.is_dir or entry.is_empty_stream:
                 continue
             # Symlinks are stored with size 0 in the index but may have pack location.
-            if entry.pack_offset == pack_offset and entry.unpack_offset == unpack_offset:
-                if entry.size == fileInfo.size or (stat.S_ISLNK(fileInfo.mode) and fileInfo.size == 0):
-                    return entry
+            if (
+                entry.pack_offset == pack_offset
+                and entry.unpack_offset == unpack_offset
+                and (entry.size == fileInfo.size or (stat.S_ISLNK(fileInfo.mode) and fileInfo.size == 0))
+            ):
+                return entry
 
-        raise RatarmountError(
-            f"Could not locate 7z member for pack_offset={pack_offset} unpack_offset={unpack_offset}"
-        )
+        raise RatarmountError(f"Could not locate 7z member for pack_offset={pack_offset} unpack_offset={unpack_offset}")
 
     def _get_folder_bytes(self, entry: SevenZipFileEntry) -> bytes:
         """Full-folder decompress path for small folders and BCJ2 multi-stream folders."""
@@ -493,7 +487,8 @@ class SevenZipMountSource(SQLiteIndexMountSource):
 
         entry = self._find_entry(fileInfo)
         assert entry.folder_index is not None
-        folder = self._archive.folders[entry.folder_index]  # type: ignore[index]
+        assert self._archive is not None
+        folder = self._archive.folders[entry.folder_index]
 
         if folder.is_encrypted() and (self._contentLocked or self._password is None):
             raise SevenZipError(
@@ -503,8 +498,7 @@ class SevenZipMountSource(SQLiteIndexMountSource):
         allow_encrypted = (not folder.is_encrypted()) or (self._password is not None)
         if not folder.is_supported_for_open(allow_encrypted=allow_encrypted):
             raise SevenZipError(
-                f"Unsupported 7z folder codecs for {entry.path!r}: "
-                f"{[m.hex() for m in folder.methods()]}"
+                f"Unsupported 7z folder codecs for {entry.path!r}: {[m.hex() for m in folder.methods()]}"
             )
 
         if folder.is_copy_only() and not folder.is_encrypted():

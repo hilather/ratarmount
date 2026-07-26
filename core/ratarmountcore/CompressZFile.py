@@ -10,7 +10,7 @@ every open.
 from __future__ import annotations
 
 import io
-from typing import IO, Union
+from typing import IO
 
 from .utils import RatarmountError, overrides
 
@@ -32,7 +32,7 @@ def _require_unlzw3() -> None:
 class IndexedCompressZFile(io.RawIOBase):
     """Seekable read-only view of a Unix compress (.Z) file."""
 
-    def __init__(self, fileobj: Union[str, IO[bytes]], **_kwargs):
+    def __init__(self, fileobj: str | IO[bytes], **_kwargs):
         super().__init__()
         _require_unlzw3()
         self._close_file = False
@@ -97,5 +97,5 @@ class IndexedCompressZFile(io.RawIOBase):
         super().close()
 
 
-def open_compress_z_file(fileobj: Union[str, IO[bytes]], **kwargs) -> IndexedCompressZFile:
+def open_compress_z_file(fileobj: str | IO[bytes], **kwargs) -> IndexedCompressZFile:
     return IndexedCompressZFile(fileobj, **kwargs)

@@ -8,7 +8,6 @@ import tempfile
 from pathlib import Path
 
 import pytest
-
 from helpers import copy_test_file, find_test_file
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -189,9 +188,11 @@ class TestLzma2FolderFilter:
         mid = len(full) // 2
         assert dec.read_range(mid, 50) == full[mid : mid + 50]
 
-        with SevenZipMountSource(path, indexFilePath=":memory:") as mount_source:
-            with mount_source.open(mount_source.lookup("/x.bin")) as file:
-                assert file.read() == full
+        with (
+            SevenZipMountSource(path, indexFilePath=":memory:") as mount_source,
+            mount_source.open(mount_source.lookup("/x.bin")) as file,
+        ):
+            assert file.read() == full
 
 
 # ---------------------------------------------------------------------------
@@ -289,21 +290,22 @@ class TestSevenZipMountSource:
         with (
             copy_test_file("file-in-non-existing-folder.7z") as path,
             SevenZipMountSource(path, indexFilePath=":memory:") as mount_source,
+            mount_source.open(mount_source.lookup("/foo2/ufo")) as file,
         ):
-            with mount_source.open(mount_source.lookup("/foo2/ufo")) as file:
-                assert file.seekable()
-                assert file.read(2) == b"ir"
-                assert file.seek(0) == 0
-                assert file.read() == b"iriya\n"
-                assert file.seek(3) == 3
-                assert file.read() == b"ya\n"
+            assert file.seekable()
+            assert file.read(2) == b"ir"
+            assert file.seek(0) == 0
+            assert file.read() == b"iriya\n"
+            assert file.seek(3) == 3
+            assert file.read() == b"ya\n"
 
     def test_solid_large_files_prefix(self):
         path = _require_fixture("two-large-files-32Ki-lines-each-1024B.7z")
         with SevenZipMountSource(path, indexFilePath=":memory:") as mount_source:
             spaces = mount_source.lookup("/spaces-32-MiB.txt")
             zeros = mount_source.lookup("/zeros-32-MiB.txt")
-            assert spaces is not None and zeros is not None
+            assert spaces is not None
+            assert zeros is not None
             assert spaces.size == 32 * 1024 * 1024
             assert zeros.size == 32 * 1024 * 1024
             with mount_source.open(spaces) as file:
@@ -328,9 +330,11 @@ class TestSevenZipMountSource:
 
     def test_open_from_file_object(self):
         path = _require_fixture("store-copy-two-files.7z")
-        with open(path, "rb") as file_obj:
-            with SevenZipMountSource(file_obj, indexFilePath=":memory:") as mount_source:
-                assert mount_source.open(mount_source.lookup("/a.txt")).read().startswith(b"AAA")
+        with (
+            open(path, "rb") as file_obj,
+            SevenZipMountSource(file_obj, indexFilePath=":memory:") as mount_source,
+        ):
+            assert mount_source.open(mount_source.lookup("/a.txt")).read().startswith(b"AAA")
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +354,8 @@ class TestSevenZipStreamingSeek:
         ) as mount_source:
             spaces = mount_source.lookup("/spaces-32-MiB.txt")
             zeros = mount_source.lookup("/zeros-32-MiB.txt")
-            assert spaces is not None and zeros is not None
+            assert spaces is not None
+            assert zeros is not None
 
             with mount_source.open(spaces) as file:
                 assert file.seekable()
@@ -428,9 +433,9 @@ class TestSevenZipEncryption:
         with (
             copy_test_file("encrypted-hello.7z") as path,
             SevenZipMountSource(path, indexFilePath=":memory:", passwords=["secret"]) as mount_source,
+            mount_source.open(mount_source.lookup("/secret.txt")) as file,
         ):
-            with mount_source.open(mount_source.lookup("/secret.txt")) as file:
-                assert file.read() == b"secret content\n"
+            assert file.read() == b"secret content\n"
 
     def test_encrypted_content_with_password(self):
         with (
@@ -464,22 +469,24 @@ class TestSevenZipEncryption:
 
     def test_encrypted_missing_password_metadata_only(self):
         """Without a password, list/stat work; open() requires a password."""
-        with copy_test_file("encrypted-hello.7z") as path:
-            with SevenZipMountSource(path, indexFilePath=":memory:") as mount_source:
-                assert mount_source._contentLocked  # pylint: disable=protected-access
-                info = mount_source.lookup("/secret.txt")
-                assert info is not None
-                assert info.size > 0
-                with pytest.raises(SevenZipError, match="password"):
-                    mount_source.open(info)
+        with (
+            copy_test_file("encrypted-hello.7z") as path,
+            SevenZipMountSource(path, indexFilePath=":memory:") as mount_source,
+        ):
+            assert mount_source._contentLocked  # pylint: disable=protected-access
+            info = mount_source.lookup("/secret.txt")
+            assert info is not None
+            assert info.size > 0
+            with pytest.raises(SevenZipError, match="password"):
+                mount_source.open(info)
 
     def test_encrypted_string_password(self):
         with (
             copy_test_file("encrypted-nested-tar.7z") as path,
             SevenZipMountSource(path, indexFilePath=":memory:", passwords=["foo"]) as mount_source,
+            mount_source.open(mount_source.lookup("/foo/fighter/ufo")) as file,
         ):
-            with mount_source.open(mount_source.lookup("/foo/fighter/ufo")) as file:
-                assert file.read() == b"iriya\n"
+            assert file.read() == b"iriya\n"
 
     def test_factory_prefers_sevenzip_for_encrypted(self):
         with copy_test_file("encrypted-hello.7z") as path:

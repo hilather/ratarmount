@@ -12,7 +12,6 @@ import zlib
 from pathlib import Path
 
 import pytest
-
 from helpers import copy_test_file, find_test_file
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -20,10 +19,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from ratarmountcore.mountsource.compositing.automount import AutoMountLayer
 from ratarmountcore.mountsource.factory import open_mount_source
 from ratarmountcore.mountsource.formats.cab import (
-    CABError,
-    CABMountSource,
     TCOMP_TYPE_MSZIP,
     TCOMP_TYPE_NONE,
+    CABError,
+    CABMountSource,
     parse_cab_archive,
 )
 from ratarmountcore.mountsource.formats.cpio import CPIOMountSource, parse_cpio_archive
@@ -99,7 +98,9 @@ class TestCPIO:
     def test_parse_rejects_garbage(self):
         import io
 
-        with pytest.raises(Exception):
+        from ratarmountcore.utils import RatarmountError
+
+        with pytest.raises(RatarmountError):
             parse_cpio_archive(io.BytesIO(b"not a cpio file!!!!"))
 
 
@@ -142,7 +143,9 @@ class TestISO9660:
     def test_parse_rejects_non_iso(self):
         import io
 
-        with pytest.raises(Exception):
+        from ratarmountcore.utils import RatarmountError
+
+        with pytest.raises(RatarmountError):
             parse_iso9660_archive(io.BytesIO(b"\x00" * 100000))
 
 
@@ -157,6 +160,7 @@ class TestWARC:
         with WARCMountSource(path, indexFilePath=":memory:") as mount_source:
             # Response payload for hello-world.txt
             target = None
+
             # Walk tree for a file containing HTTP response body text
             def find(path_prefix="/"):
                 nonlocal target
@@ -220,10 +224,7 @@ class TestXAR:
     def test_xar_xz_member_open(self):
         """Synthetic XAR-style open path for xz-encoded members (via linkname encoding)."""
         import lzma
-        import io as _io
         import tempfile
-        from ratarmountcore.mountsource import FileInfo
-        from ratarmountcore.SQLiteIndex import SQLiteIndexedTarUserData
 
         # Build a tiny fake "heap" file with xz payload; use XARMountSource.open logic via stub.
         plain = b"xz-payload-hello-world\n" * 10
@@ -243,8 +244,9 @@ class TestXAR:
             class _X(XARMountSource):
                 def __init__(self, path, packed_len):
                     # Bypass parse: open file and finalize with one row
-                    from ratarmountcore.mountsource.formats.stenciled import make_file_row
                     import stat as st
+
+                    from ratarmountcore.mountsource.formats.stenciled import make_file_row
 
                     def build_rows(fileobj):
                         return [
@@ -285,7 +287,8 @@ class TestRPM:
 
         with open(path, "rb") as f:
             offset, size, compressor = parse_rpm_payload_location(f)
-        assert offset > 0 and size > 0
+        assert offset > 0
+        assert size > 0
         assert compressor == "gzip"
 
         with RPMMountSource(path, indexFilePath=":memory:") as mount_source:
@@ -420,6 +423,7 @@ class TestCAB:
         # Our synthetic writer currently emits one block; construct two CK+deflate blocks manually.
         plain1 = b"A" * 1000 + b"MARKER1" + b"B" * 1000
         plain2 = b"C" * 500 + b"MARKER2" + b"D" * 500
+
         # Compress as independent CK blocks (still valid if no cross-block refs) + chained history path.
         def mszip_block(data: bytes) -> bytes:
             c = zlib.compressobj(level=9, wbits=-15)
@@ -429,7 +433,6 @@ class TestCAB:
         b2 = mszip_block(plain2)
         # Build CAB with 2 CFDATA for one MSZIP folder, one file spanning both.
         stream = plain1 + plain2
-        files = [("big.txt", stream)]
         # Manual CAB (same layout as _write_cab but multi CFDATA)
         cffile = struct.pack("<IIHHHH", len(stream), 0, 0, 0x4E93, 0x64CA, 0x20) + b"big.txt\x00"
         coff_files = 36 + 8
@@ -445,7 +448,8 @@ class TestCAB:
         with CABMountSource(io.BytesIO(cab), indexFilePath=":memory:") as ms:
             data = ms.open(ms.lookup("/big.txt")).read()
             assert data == stream
-            assert b"MARKER1" in data and b"MARKER2" in data
+            assert b"MARKER1" in data
+            assert b"MARKER2" in data
 
 
 # ---------------------------------------------------------------------------
@@ -471,9 +475,7 @@ class TestDebComposition:
             # Navigate into data.tar.* if present
             data_member = next((n for n in names if n.startswith("data.tar")), None)
             if data_member:
-                # list inside recursively mounted data archive
-                listing = auto.list("/" + data_member)
-                # May be empty package; just ensure no crash
-                assert listing is not None or True
+                # list inside recursively mounted data archive; may be empty — just ensure no crash
+                auto.list("/" + data_member)
         finally:
             base.close()

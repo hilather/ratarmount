@@ -9,7 +9,6 @@ from .formats.ar import ARMountSource
 from .formats.asar import ASARMountSource
 from .formats.cab import CABMountSource
 from .formats.cpio import CPIOMountSource
-from .formats.rpm import RPMMountSource
 from .formats.ext4 import EXT4MountSource
 from .formats.fat import FATMountSource
 from .formats.html import HTMLMountSource
@@ -19,6 +18,7 @@ from .formats.ogg import OGGMountSource
 from .formats.pdf import PDFMountSource
 from .formats.py7zr import Py7zrMountSource
 from .formats.rar import RarMountSource
+from .formats.rpm import RPMMountSource
 from .formats.sevenzip import SevenZipMountSource
 from .formats.sqlar import SQLARMountSource
 from .formats.squashfs import SquashFSMountSource

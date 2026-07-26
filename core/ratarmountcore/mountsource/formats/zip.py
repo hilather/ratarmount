@@ -76,9 +76,8 @@ class ZipMountSource(SQLiteIndexMountSource):
                 local = fp.read(30)
                 if len(local) < 30 or local[:4] != b"PK\x03\x04":
                     # Fallback: central-dir name/extra lengths
-                    return info.header_offset + 30 + len(info.filename.encode(zf.metadata_encoding or "utf-8")) + len(
-                        info.extra or b""
-                    )
+                    encoding = getattr(zf, "metadata_encoding", None) or "utf-8"
+                    return info.header_offset + 30 + len(info.filename.encode(encoding)) + len(info.extra or b"")
                 _sig, _ver, _flags, _method, _time, _date, _crc, _csize, _usize, nlen, elen = struct.unpack(
                     "<IHHHHHIIIHH", local
                 )
@@ -190,7 +189,9 @@ class ZipMountSource(SQLiteIndexMountSource):
                 archive.close()
 
             if buffering == 0:
-                f = RawStenciledFile([(archive, data_offset, info.file_size)], lock)
+                f: Union[RawStenciledFile, StenciledFile] = RawStenciledFile(
+                    [(archive, data_offset, info.file_size)], lock
+                )
             else:
                 f = StenciledFile(
                     [(archive, data_offset, info.file_size)],

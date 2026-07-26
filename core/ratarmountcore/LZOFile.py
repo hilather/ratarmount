@@ -15,7 +15,7 @@ import io
 import logging
 import struct
 from dataclasses import dataclass
-from typing import IO, Optional, Union
+from typing import IO
 
 from .utils import RatarmountError, overrides
 
@@ -97,14 +97,14 @@ class LZOFileInfo:
 
 
 def parse_lzop_file(fileobj: IO[bytes]) -> LZOFileInfo:
-    start = fileobj.tell()
+    fileobj.tell()
     magic = _read_exact(fileobj, 9)
     if magic != LZOP_MAGIC:
         raise LZOError(f"Invalid LZOP magic: {magic!r}")
 
-    version, _lib_version, _version_needed = struct.unpack(">HHH", _read_exact(fileobj, 6))
+    _version, _lib_version, _version_needed = struct.unpack(">HHH", _read_exact(fileobj, 6))
     method = _read_exact(fileobj, 1)[0]
-    _level = _read_exact(fileobj, 1)[0]
+    _read_exact(fileobj, 1)  # compression level
     (flags,) = struct.unpack(">I", _read_exact(fileobj, 4))
 
     if flags & F_H_FILTER:
@@ -160,7 +160,7 @@ def parse_lzop_file(fileobj: IO[bytes]) -> LZOFileInfo:
 class IndexedLZOFile(io.RawIOBase):
     """Seekable read-only LZOP file."""
 
-    def __init__(self, fileobj: Union[str, IO[bytes]], **_kwargs):
+    def __init__(self, fileobj: str | IO[bytes], **_kwargs):
         super().__init__()
         _load_lzo()
         self._close_file = False
@@ -173,7 +173,7 @@ class IndexedLZOFile(io.RawIOBase):
         self._info = parse_lzop_file(self._file)
         self._size = self._info.total_uncompressed
         self._pos = 0
-        self._cache: Optional[tuple[int, bytes]] = None  # block index, data
+        self._cache: tuple[int, bytes] | None = None  # block index, data
 
     @property
     def size(self) -> int:
@@ -216,10 +216,7 @@ class IndexedLZOFile(io.RawIOBase):
         block = self._info.blocks[index]
         self._file.seek(block.data_offset)
         payload = _read_exact(self._file, block.compressed_size)
-        if block.is_stored:
-            data = payload
-        else:
-            data = lzo_decompress_block(payload, block.uncompressed_size)
+        data = payload if block.is_stored else lzo_decompress_block(payload, block.uncompressed_size)
         self._cache = (index, data)
         return data
 
@@ -263,5 +260,5 @@ class IndexedLZOFile(io.RawIOBase):
         super().close()
 
 
-def open_lzo_file(fileobj: Union[str, IO[bytes]], **kwargs) -> IndexedLZOFile:
+def open_lzo_file(fileobj: str | IO[bytes], **kwargs) -> IndexedLZOFile:
     return IndexedLZOFile(fileobj, **kwargs)

@@ -19,17 +19,19 @@ import stat
 import struct
 import threading
 import zlib
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Union, cast
+from typing import IO, TYPE_CHECKING, Union, cast
 
 from ratarmountcore.mountsource import FileInfo, MountSource
-from ratarmountcore.mountsource.SQLiteIndexMountSource import SQLiteIndexMountSource
 from ratarmountcore.mountsource.formats.stenciled import make_file_row
+from ratarmountcore.mountsource.SQLiteIndexMountSource import SQLiteIndexMountSource
 from ratarmountcore.SQLiteIndex import SQLiteIndex
 from ratarmountcore.StenciledFile import RawStenciledFile, StenciledFile
 from ratarmountcore.utils import RatarmountError, overrides
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +242,9 @@ def _mszip_decompress_block(block: bytes, uncompressed_size: int, history: bytes
     if history and hasattr(zlib.decompressobj(wbits=-15), "set_dictionary"):
         try:
             dobj = zlib.decompressobj(wbits=-15)
-            dobj.set_dictionary(history[-_MSZIP_WINDOW:])
+            set_dictionary = getattr(dobj, "set_dictionary", None)
+            if set_dictionary is not None:
+                set_dictionary(history[-_MSZIP_WINDOW:])
             out = dobj.decompress(payload, uncompressed_size)
             out += dobj.flush()
             return out[:uncompressed_size] if uncompressed_size else out
@@ -253,7 +257,7 @@ def _mszip_decompress_block(block: bytes, uncompressed_size: int, history: bytes
 
 
 class CABMountSource(SQLiteIndexMountSource):
-    def __init__(self, fileOrPath: Union[str, IO[bytes], Path], **options) -> None:
+    def __init__(self, fileOrPath: str | IO[bytes] | Path, **options) -> None:
         if isinstance(fileOrPath, Path):
             fileOrPath = str(fileOrPath)
         self.isFileObject = not isinstance(fileOrPath, str)
@@ -311,23 +315,23 @@ class CABMountSource(SQLiteIndexMountSource):
             return self._folder_plain_cache[folder_index]
         folder = self._cab.folders[folder_index]
         if folder.type_compress == TCOMP_TYPE_NONE:
-            parts = []
+            store_parts: list[bytes] = []
             with self.fileObjectLock:
                 for block in folder.blocks:
                     self.fileObject.seek(block.offset)
-                    parts.append(self.fileObject.read(block.compressed_size))
-            plain = b"".join(parts)
+                    store_parts.append(self.fileObject.read(block.compressed_size))
+            plain = b"".join(store_parts)
         elif folder.type_compress == TCOMP_TYPE_MSZIP:
-            parts: list[bytes] = []
+            mszip_parts: list[bytes] = []
             history = b""
             with self.fileObjectLock:
                 for block in folder.blocks:
                     self.fileObject.seek(block.offset)
                     raw = self.fileObject.read(block.compressed_size)
                     chunk = _mszip_decompress_block(raw, block.uncompressed_size, history)
-                    parts.append(chunk)
+                    mszip_parts.append(chunk)
                     history = (history + chunk)[-_MSZIP_WINDOW:]
-            plain = b"".join(parts)
+            plain = b"".join(mszip_parts)
         else:
             raise CABError(f"Unsupported CAB compression {folder.type_compress}")
         self._folder_plain_cache[folder_index] = plain
@@ -342,9 +346,8 @@ class CABMountSource(SQLiteIndexMountSource):
         for block in folder.blocks:
             block_start = block.uncompressed_offset
             block_end = block_start + block.uncompressed_size
-            if remaining <= 0 or pos >= block_end:
-                if pos >= block_end:
-                    continue
+            if (remaining <= 0 or pos >= block_end) and pos >= block_end:
+                continue
             if pos < block_start:
                 continue
             local = pos - block_start

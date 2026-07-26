@@ -26,6 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "core"))
 
+import contextlib
+
 from ratarmountcore.mountsource.formats.libarchive import LibarchiveMountSource  # noqa: E402
 from ratarmountcore.mountsource.formats.sevenzip import SevenZipMountSource  # noqa: E402
 
@@ -52,7 +54,10 @@ def _iter_files(mount_source):
         if isinstance(listing, dict):
             items = listing.items()
         else:
-            items = ((name, mount_source.lookup(f"{path.rstrip('/')}/{name}" if path != "/" else f"/{name}")) for name in listing)
+            items = (
+                (name, mount_source.lookup(f"{path.rstrip('/')}/{name}" if path != "/" else f"/{name}"))
+                for name in listing
+            )
         for name, info in items:
             if info is None:
                 continue
@@ -86,7 +91,6 @@ def bench_backend(name: str, ctor, archive: str) -> dict:
         large = max(files, key=lambda item: item[1].size)
 
         path, info = mid
-        size_mid = info.size
 
         # Cold open (first touch after mount) — important for stream codecs.
         try:
@@ -151,10 +155,8 @@ def bench_backend(name: str, ctor, archive: str) -> dict:
     except Exception as exception:
         result["error"] = str(exception)
     finally:
-        try:
+        with contextlib.suppress(Exception):
             mount_source.close()
-        except Exception:
-            pass
     return result
 
 
